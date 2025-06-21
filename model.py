@@ -178,15 +178,58 @@ class UNET_OutputLayer(nn.Module):
 class Diffusion(nn.Module):
     def __init__(self):
         super().__init__()
+        # 1) Project timestep scalar → 320-d
+        self.time_proj = nn.Sequential(
+            nn.Linear(1, 320),
+            nn.SiLU(),
+        )
+        # 2) Expand to 1280-d
         self.time_embedding = TimeEmbedding(320)
+
+        # Context: expr label + valence/arousal
+        self.expr_embedding = nn.Embedding(8, 128)
+        self.va_proj = nn.Sequential(
+            nn.Linear(2, 128),
+            nn.SiLU(),
+            nn.Linear(128, 128)
+        )
+        self.context_proj = nn.Linear(256, 768)
+
+        # UNet + output
         self.unet = UNET()
         self.final = UNET_OutputLayer(320, 4)
 
-    def forward(self, latent, context, time):
-        time = self.time_embedding(time)
-        output = self.unet(latent, context, time)
-        output = self.final(output)
-        return output
+        # Auxiliary heads
+        self.expr_head = nn.Linear(320, 8)
+        self.val_head = nn.Linear(320, 1)
+        self.aro_head = nn.Linear(320, 1)
+
+    def get_context(self, expr_label, valence, arousal):
+        expr_emb = self.expr_embedding(expr_label)                  # (B,128)
+        va_emb = self.va_proj(torch.stack([valence, arousal], 1))  # (B,128)
+        ctx = torch.cat([expr_emb, va_emb], dim=1)                  # (B,256)
+        return self.context_proj(ctx)                              # (B,768)
+
+    def forward(self, latent, expr_label, valence, arousal, time):
+        # context embedding
+        context = self.get_context(expr_label, valence, arousal)    # (B,768)
+        # time embedding
+        t = self.time_proj(time)                                    # (B,320)
+        t = self.time_embedding(t)                                  # (B,1280)
+
+        # UNet denoising
+        features = self.unet(latent, context, t)                    # (B,320,H,W)
+        pred_noise = self.final(features)                           # (B,4,H,W)
+
+        # auxiliary predictions
+        gf = features.mean(dim=(2,3))                               # (B,320)
+        expr_pred = self.expr_head(gf)                              # (B,8)
+        val_pred = self.val_head(gf).squeeze(1)                     # (B,)
+        aro_pred = self.aro_head(gf).squeeze(1)                     # (B,)
+
+        return pred_noise, expr_pred, val_pred, aro_pred
+
+
 
 class DDPMSampler:
     def __init__(self, generator: torch.Generator, num_training_steps=1000, beta_start: float = 0.00085,
@@ -434,7 +477,7 @@ class VAE_Encoder(nn.Sequential):
         stdev = variance.sqrt()
         x = mean + stdev * noise
         x *= 0.18215
-        return x
+        return x, mean, log_variance
 
 class SelfAttention(nn.Module):
     def __init__(self, n_heads, d_embed, in_proj_bias=True, out_proj_bias=True):
@@ -525,3 +568,38 @@ if __name__ == '__main__':
     img = img.permute(1, 2, 0).detach().numpy()
     cv2.imshow("img", img)
     cv2.waitKey(0)
+
+    from model import DDPMSampler
+    from PIL import Image
+    import torch
+    import numpy as np
+    import matplotlib.pyplot as plt
+
+    generator = torch.Generator().manual_seed(0)
+    sampler = DDPMSampler(generator=generator)
+
+    img = Image.open("1.jpg").convert("RGB")
+    img_np = np.array(img)
+    img_tensor = torch.tensor(img_np, dtype=torch.float32).permute(2, 0, 1)  # (C, H, W)
+    img_tensor = ((img_tensor / 255.0) * 2.0) - 1.0  # Chuẩn hóa [-1, 1]
+    img_tensor = img_tensor.unsqueeze(0)  # (1, C, H, W)
+
+    noise_levels = [0, 10, 50, 100, 250, 500, 750]
+    timesteps = torch.tensor(noise_levels, dtype=torch.long)
+
+    batch = img_tensor.repeat(len(noise_levels), 1, 2, 2)  # (B, C, H, W)
+
+    noised_imgs = sampler.add_noise(batch, timesteps)  # (B, C, H, W)
+
+    noised_imgs = (noised_imgs.clamp(-1, 1) + 1) / 2
+    noised_imgs = (noised_imgs * 255).type(torch.uint8).permute(0, 2, 3, 1)  # (B, H, W, C)
+
+    plt.figure(figsize=(20, 4))
+    for i, t in enumerate(noise_levels):
+        plt.subplot(1, len(noise_levels), i + 1)
+        plt.imshow(noised_imgs[i].cpu().numpy())
+        plt.title(f"t = {t}")
+        plt.axis("off")
+    plt.tight_layout()
+    plt.show()
+
