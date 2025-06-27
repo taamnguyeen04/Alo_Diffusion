@@ -11,7 +11,8 @@ from torchvision.transforms import Resize, ToTensor, Compose, Normalize
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from model import VAE_Encoder, VAE_Decoder, CLIP, Diffusion, DDPMSampler
-from dataset import Affectnet
+from dataset import Affectnet, AffectnetPt
+from icecream import ic
 
 def save_checkpoint(filepath, epoch, step, diffusion, optimizer, loss):
     checkpoint = {
@@ -82,12 +83,13 @@ def cout(a):
     print("****************************")
 
 def train():
-    batch_size = 4
+    batch_size = 2
     lr = 1e-4
     num_epochs = 100
     image_channels = 3
     c_dim = 11
     image_size = 224
+    accumulation_steps = 4
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     labels = ["angry", "disgust", "fear","happy", "neutral", "sad", "surprise"]
 
@@ -112,13 +114,14 @@ def train():
 
 
     transform = Compose([
-        Resize((image_size, image_size)),
-        ToTensor(),
+        # Resize((image_size, image_size)),
+        # ToTensor(),
         Normalize(mean=[0.5402, 0.4410, 0.3938], std=[0.2914, 0.2657, 0.2609]),#tìm mean std
     ])
     # Data loader
     # train_dataset = ImageFolder(root='/home/tam/Desktop/pythonProject1/archive/AffectNet/data', transform=transform)
-    train_dataset = Affectnet(root="C:/Users/tam/Documents/data/Affectnet", is_train=True, transform=transform)
+    # train_dataset = Affectnet(root="C:/Users/tam/Documents/data/Affectnet", is_train=True, transform=transform)
+    train_dataset = AffectnetPt(root="C:/Users/tam/Documents/data/Affectnet", is_train=True, transform=transform)
     train_dataloader = DataLoader(
         dataset=train_dataset,
         batch_size=batch_size,
@@ -127,7 +130,8 @@ def train():
         drop_last=True
     )
 
-    val_dataset = Affectnet(root="C:/Users/tam/Documents/data/Affectnet", is_train=False, transform=transform)
+    # val_dataset = Affectnet(root="C:/Users/tam/Documents/data/Affectnet", is_train=False, transform=transform)
+    val_dataset = AffectnetPt(root="C:/Users/tam/Documents/data/Affectnet", is_train=False, transform=transform)
     val_dataloader = DataLoader(
         dataset=val_dataset,
         batch_size=batch_size,
@@ -140,7 +144,7 @@ def train():
     # Load checkpoint VAE
     encoder = VAE_Encoder().to(device)
     decoder = VAE_Decoder().to(device)
-    vae_ckpt_path = "VAE/model/best_model1.pt"
+    vae_ckpt_path = r"C:\Users\tam\Downloads\VAE\model\best_model.pt"
     vae_ckpt = torch.load(vae_ckpt_path, map_location=device)
     encoder.load_state_dict(vae_ckpt['encoder_state_dict'])
     decoder.load_state_dict(vae_ckpt['decoder_state_dict'])
@@ -179,51 +183,63 @@ def train():
                 valence_trg = valence_org[rand_idx]
                 arousal_trg = arousal_org[rand_idx]
 
-                img_real = img_real.to(device)
-                label_trg = label_trg.to(device)
-                valence_trg = valence_trg.to(device)
-                arousal_trg = arousal_trg.to(device)
+                loss_accum = 0.0
+                actual_batch_size = 8
+                mini_batch_size = actual_batch_size // accumulation_steps
 
-                # Encode ảnh → latent
-                noise = torch.randn(1, 4, 28, 28).to(torch.float32).to(device)
+                for acc_i in range(accumulation_steps):
+                    start_idx = acc_i * mini_batch_size
+                    end_idx = (acc_i + 1) * mini_batch_size if acc_i < accumulation_steps - 1 else actual_batch_size
+                    if end_idx <= start_idx:
+                        ic(end_idx, start_idx, acc_i, mini_batch_size)
+                        continue
+                    ic(end_idx, start_idx)
+                    mini_img = img_real[start_idx:end_idx].to(device)
+                    mini_label = label_trg[start_idx:end_idx].to(device)
+                    mini_val = valence_trg[start_idx:end_idx].to(device)
+                    mini_aro = arousal_trg[start_idx:end_idx].to(device)
+                    ic(mini_img)
+                    ic(mini_label)
+                    ic(mini_val)
+                    ic(mini_aro)
+                    noise = torch.randn(mini_img.size(0), 4, 28, 28).to(torch.float32).to(device)
 
-                with torch.no_grad():
-                    latent, _, _ = encoder(img_real, noise)
+                    with torch.no_grad():
+                        latent, _, _ = encoder(mini_img, noise)
+                    latent = latent.to(device)
 
-                B, C, H, W = latent.shape
-                pad_h = (8 - H % 8) % 8
-                pad_w = (8 - W % 8) % 8
-                latent = F.pad(latent, (0, pad_w, 0, pad_h), mode='reflect')
+                    B, C, H, W = latent.shape
+                    pad_h = (8 - H % 8) % 8
+                    pad_w = (8 - W % 8) % 8
+                    latent = F.pad(latent, (0, pad_w, 0, pad_h), mode='reflect')
 
-                # Add noise
-                timestep = torch.randint(0, sampler.num_train_timesteps, (img_real.size(0),), device=device).long()
-                noisy_latent = sampler.add_noise(latent, timestep)
+                    timestep = torch.randint(0, sampler.num_train_timesteps, (mini_img.size(0),), device=device).long()
+                    noisy_latent = sampler.add_noise(latent, timestep)
 
-                pred_noise, expr_pred, val_pred, aro_pred = diffusion(
-                    latent=noisy_latent,
-                    expr_label=label_trg,
-                    valence=valence_trg,
-                    arousal=arousal_trg,
-                    time=timestep.unsqueeze(-1).float()
-                )
+                    pred_noise, expr_pred, val_pred, aro_pred = diffusion(
+                        latent=noisy_latent,
+                        expr_label=mini_label,
+                        valence=mini_val,
+                        arousal=mini_aro,
+                        time=timestep.unsqueeze(-1).float()
+                    )
 
-                # Loss chính
-                mse_loss = nn.MSELoss()(pred_noise, torch.randn_like(pred_noise))
+                    mse_loss = nn.MSELoss()(pred_noise, torch.randn_like(pred_noise))
+                    expr_loss = nn.CrossEntropyLoss()(expr_pred, mini_label)
+                    val_loss = nn.MSELoss()(val_pred, mini_val)
+                    aro_loss = nn.MSELoss()(aro_pred, mini_aro)
 
-                # Loss phụ (dự đoán expr, valence, arousal)
-                expr_loss = nn.CrossEntropyLoss()(expr_pred, label_trg)
-                val_loss = nn.MSELoss()(val_pred, valence_trg)
-                aro_loss = nn.MSELoss()(aro_pred, arousal_trg)
+                    loss = mse_loss + alpha * (expr_loss + val_loss + aro_loss)
+                    loss_accum += loss.item()
 
-                # Tổng loss
-                loss = mse_loss + alpha * (expr_loss + val_loss + aro_loss)
+                    loss = loss / accumulation_steps  # chia loss cho số accumulation
+                    loss.backward()
 
-                # Backprop
-                diffusion_optimizer.zero_grad()
-                loss.backward()
                 diffusion_optimizer.step()
+                diffusion_optimizer.zero_grad()
 
-                print(f"[Epoch {epoch} Iter {i}] Loss: {loss.item():.4f} | MSE: {mse_loss.item():.4f} | expr: {expr_loss.item():.4f} | val: {val_loss.item():.4f} | aro: {aro_loss.item():.4f}")
+                print(f"[Epoch {epoch} Iter {i}] Avg Loss: {loss_accum:.4f}")
+
                 if i % 10 == 0:
                     writer.add_scalar("Loss/Total", loss.item(), epoch * len(train_dataloader) + i)
                     writer.add_scalar("Loss/MSE", mse_loss.item(), epoch * len(train_dataloader) + i)

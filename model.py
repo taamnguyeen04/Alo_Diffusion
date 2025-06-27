@@ -72,17 +72,17 @@ class UNET_AttentionBlock(nn.Module):
         residue_short = x
         x = self.layernorm_1(x)
         x = self.attention_1(x)
-        x += residue_short
+        x = x + residue_short
         residue_short = x
         x = self.layernorm_2(x)
         x = self.attention_2(x, context)
-        x += residue_short
+        x = x + residue_short
         residue_short = x
         x = self.layernorm_3(x)
         x, gate = self.linear_geglu_1(x).chunk(2, dim=-1)
         x = x * F.gelu(gate)
         x = self.linear_geglu_2(x)
-        x += residue_short
+        x = x + residue_short
         x = x.transpose(-1, -2)
         x = x.view((n, c, h, w))
         return self.conv_output(x) + residue_long
@@ -320,7 +320,7 @@ class CLIPEmbedding(nn.Module):
 
     def forward(self, tokens):
         x = self.token_embedding(tokens)
-        x += self.position_embedding
+        x = x + self.position_embedding
         return x
 
 class CLIPLayer(nn.Module):
@@ -336,13 +336,13 @@ class CLIPLayer(nn.Module):
         residue = x
         x = self.layernorm_1(x)
         x = self.attention(x, causal_mask=True)
-        x += residue
+        x = x + residue
         residue = x
         x = self.layernorm_2(x)
         x = self.linear_1(x)
         x = x * torch.sigmoid(1.702 * x)
         x = self.linear_2(x)
-        x += residue
+        x = x + residue
         return x
 
 class CLIP(nn.Module):
@@ -377,7 +377,7 @@ class VAE_AttentionBlock(nn.Module):
         x = self.attention(x)
         x = x.transpose(-1, -2)
         x = x.view((n, c, h, w))
-        x += residue
+        x = x + residue
         return x
 
 class VAE_ResidualBlock(nn.Module):
@@ -436,7 +436,7 @@ class VAE_Decoder(nn.Sequential):
         )
 
     def forward(self, x):
-        x /= 0.18215
+        x = x / 0.18215
         for module in self:
             x = module(x)
         return x
@@ -476,7 +476,7 @@ class VAE_Encoder(nn.Sequential):
         variance = log_variance.exp()
         stdev = variance.sqrt()
         x = mean + stdev * noise
-        x *= 0.18215
+        x = x * 0.18215
         return x, mean, log_variance
 
 class SelfAttention(nn.Module):
@@ -501,7 +501,7 @@ class SelfAttention(nn.Module):
             mask = torch.ones_like(weight, dtype=torch.bool).triu(1)
             weight.masked_fill_(mask, -torch.inf)
 
-        weight /= math.sqrt(self.d_head)
+        weight = weight / math.sqrt(self.d_head)
         weight = F.softmax(weight, dim=-1)
         output = weight @ v
         output = output.transpose(1, 2)
@@ -530,7 +530,7 @@ class CrossAttention(nn.Module):
         k = k.view(interim_shape).transpose(1, 2)
         v = v.view(interim_shape).transpose(1, 2)
         weight = q @ k.transpose(-1, -2)
-        weight /= math.sqrt(self.d_head)
+        weight = weight / math.sqrt(self.d_head)
         weight = F.softmax(weight, dim=-1)
         output = weight @ v
         output = output.transpose(1, 2).contiguous()
