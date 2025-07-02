@@ -8,7 +8,7 @@ import pandas as pd
 from torchvision.transforms.functional import to_pil_image
 from tqdm import tqdm
 import torch.nn.functional as F
-
+import time
 
 class Affectnet(Dataset):
     def __init__(self, root, is_train, transform=None):
@@ -95,12 +95,11 @@ class AffectnetPt(Dataset):
                 self.data_index.append((file_path, i))
 
     def __len__(self):
-        return len(self.list_file)
+        return len(self.data_index)
 
     def __getitem__(self, idx):
         file_path, inner_idx = self.data_index[idx]
 
-        # ❌ Không dùng cache → load trực tiếp
         data = torch.load(file_path, map_location="cpu")
         img = data["images"][inner_idx]
         expr = data["expressions"][inner_idx]
@@ -113,6 +112,24 @@ class AffectnetPt(Dataset):
 
         return img, expr, val, aro
 
+def measure_load_time(dataset_class, dataset_name, root, is_train=True, transform=None, batch_size=64, num_workers=4):
+    dataset = dataset_class(root=root, is_train=is_train, transform=transform)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+
+    print(f"/n⏳ Loading from {dataset_name}...")
+    start_time = time.time()
+
+    total = 0
+    for batch in dataloader:
+        total += batch[0].size(0)
+
+    end_time = time.time()
+    duration = end_time - start_time
+    print(f"✅ {dataset_name}: Loaded {total} samples in {duration:.2f} seconds")
+
+
+
+
 def cout(a):
     print("****************************")
     print(a)
@@ -121,10 +138,10 @@ def cout(a):
 
 if __name__ == '__main__':
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    # transform = Compose([
-    #     Resize((224, 224)),
-    #     ToTensor()
-    # ])
+    transform = Compose([
+        Resize((224, 224)),
+        ToTensor()
+    ])
     #
     # dataset = Affectnet(root="C:/Users/tam/Documents/data/Affectnet", is_train=True, transform=transform)
     # print(len(dataset))
@@ -159,7 +176,13 @@ if __name__ == '__main__':
     #     # save_path="affectnet_val.pt"
     # )
 
-    transform = Normalize(mean=[0.5402, 0.4410, 0.3938], std=[0.2914, 0.2657, 0.2609])
+    # transform = Normalize(mean=[0.5402, 0.4410, 0.3938], std=[0.2914, 0.2657, 0.2609])
     dataset = AffectnetPt(root="chunks1024", is_train=False, transform=transform)
     cout((dataset))
     # cout(len(dataset[1][3]))
+    csv_root = "C:/Users/tam/Documents/data/Affectnet"  # thư mục chứa Manually_Annotated_Images, training.csv
+    pt_root = "chunks1024"  # thư mục chứa train/*.pt, val/*.pt
+
+    # So sánh tốc độ
+    measure_load_time(Affectnet, "AffectNet CSV + JPG", csv_root, is_train=True, transform=transform)
+    measure_load_time(AffectnetPt, "AffectNet .pt chunks", pt_root, is_train=True)
