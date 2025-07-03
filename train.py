@@ -14,8 +14,11 @@ from model import VAE_Encoder, VAE_Decoder, CLIP, Diffusion, DDPMSampler
 from dataset import Affectnet, AffectnetPt
 from icecream import ic
 import time
+from tqdm import tqdm
 
 def save_checkpoint(filepath, epoch, step, diffusion, optimizer, loss):
+    print(f"💾 Đang lưu checkpoint an toàn: epoch {epoch}, step {step}, loss {loss.item():.4f}")
+
     checkpoint = {
         'epoch': epoch,
         'step': step,
@@ -23,28 +26,74 @@ def save_checkpoint(filepath, epoch, step, diffusion, optimizer, loss):
         'diffusion_state_dict': diffusion.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
     }
-    torch.save(checkpoint, os.path.join(filepath, "last_model.pt"))
-    if not os.path.exists(os.path.join(filepath, "best_model.pt")) or loss.item() < checkpoint['loss']:
-        torch.save(checkpoint, os.path.join(filepath, "best_model.pt"))
+
+    tmp_last = os.path.join(filepath, "last_model.pt.tmp")
+    final_last = os.path.join(filepath, "last_model.pt")
+    torch.save(checkpoint, tmp_last)
+    os.replace(tmp_last, final_last)  # atomic operation, tránh file hỏng
+
+    best_path = os.path.join(filepath, "best_model.pt")
+    tmp_best = os.path.join(filepath, "best_model.pt.tmp")
+
+    if not os.path.exists(best_path):
+        torch.save(checkpoint, tmp_best)
+        os.replace(tmp_best, best_path)
+        print("🏆 Đã lưu best_model.pt (lần đầu)")
+    else:
+        try:
+            best_loss = torch.load(best_path, map_location='cpu')['loss']
+            if loss.item() < best_loss:
+                torch.save(checkpoint, tmp_best)
+                os.replace(tmp_best, best_path)
+                print("🏆 Cập nhật best_model.pt (tốt hơn)")
+        except Exception as e:
+            print(f"⚠️ Lỗi khi đọc best_model.pt cũ: {e}, tiến hành lưu đè")
+            torch.save(checkpoint, tmp_best)
+            os.replace(tmp_best, best_path)
+
 
 def load_checkpoint(filepath, diffusion, optimizer, best_loss, device):
     last_path = os.path.join(filepath, "last_model.pt")
     best_path = os.path.join(filepath, "best_model.pt")
+
+    start_epoch = 0
+    loaded = False
+
     if os.path.isfile(last_path):
-        print(f"Loading checkpoint '{last_path}'")
-        checkpoint = torch.load(last_path, map_location=device)
-        diffusion.load_state_dict(checkpoint['diffusion_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        start_epoch = checkpoint['epoch']
-        print(f"Loaded epoch {start_epoch}, step {checkpoint['step']}")
-    else:
-        print("No checkpoint found. Start from scratch.")
+        try:
+            checkpoint = torch.load(last_path, map_location=device)
+            diffusion.load_state_dict(checkpoint['diffusion_state_dict'])
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            start_epoch = checkpoint['epoch']
+            loaded = True
+        except Exception as e:
+            print(f"⚠️ Lỗi khi load last_model.pt: {e}")
+
+    if not loaded and os.path.isfile(best_path):
+        try:
+            checkpoint = torch.load(best_path, map_location="cpu")
+            diffusion.load_state_dict(checkpoint['diffusion_state_dict'])
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            start_epoch = checkpoint['epoch']
+            print(f"✅ Loaded từ best_model.pt epoch {start_epoch}, step {checkpoint['step']}")
+            loaded = True
+        except Exception as e:
+            print(f"⚠️ Lỗi khi load best_model.pt: {e}")
+
+    if not loaded:
+        print("🚀 Không tìm thấy hoặc không load được checkpoint, bắt đầu từ đầu.")
         start_epoch = 0
+
     if os.path.isfile(best_path):
-        best_loss = torch.load(best_path, map_location=device)['loss']
+        try:
+            best_loss = torch.load(best_path, map_location=device)['loss']
+        except:
+            best_loss = float('inf')
     else:
         best_loss = float('inf')
+
     return start_epoch, best_loss
+
 
 def gradient_penalty(device, y, x):
     weight = torch.ones(y.size()).to(device)
@@ -59,18 +108,9 @@ def gradient_penalty(device, y, x):
     dydx_l2norm = torch.sqrt(torch.sum(dydx**2, dim=1))
     return torch.mean((dydx_l2norm-1)**2)
 
-def label2onehot(labels, dim):
-    batch_size = labels.size(0)
-    out = torch.zeros(batch_size, dim)
-    out[np.arange(batch_size), labels.long()] = 1
-    return out
 
-def create_labels(c_org, c_dim=5):
-    c_trg_list = []
-    for i in range(c_dim):
-        c_trg = label2onehot(torch.ones(c_org.size(0)) * i, c_dim)
-        c_trg_list.append(c_trg)
-    return c_trg_list
+
+
 
 def compute_kl_loss(mean, logvar):
     return -0.5 * torch.sum(1 + logvar - mean.pow(2) - logvar.exp()) / mean.size(0)
@@ -82,7 +122,11 @@ def cout(a):
     print("****************************")
 
 def train():
-    batch_size = 8
+    # Thêm ở đầu train.py
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    batch_size = 4
     lr = 1e-4
     num_epochs = 100
     image_channels = 3
@@ -121,7 +165,7 @@ def train():
     print("train_dataloader")
     # train_dataset = ImageFolder(root='/home/tam/Desktop/pythonProject1/archive/AffectNet/data', transform=transform)
     # train_dataset = Affectnet(root="C:/Users/tam/Documents/data/Affectnet", is_train=True, transform=transform)
-    train_dataset = AffectnetPt(root="C:/Users/tam/Documents/data/Affectnet", is_train=False, transform=transform)
+    train_dataset = AffectnetPt(root="C:/Users/tam/Documents/data/Affectnet", is_train=True, transform=transform)
     train_dataloader = DataLoader(
         dataset=train_dataset,
         batch_size=batch_size,
@@ -144,12 +188,14 @@ def train():
     # Models
     # Load checkpoint VAE
     print("models")
-    encoder = VAE_Encoder().to(device)
-    decoder = VAE_Decoder().to(device)
+    encoder = VAE_Encoder()
+    decoder = VAE_Decoder()
     vae_ckpt_path = r"C:\Users\tam\Downloads\VAE\model\best_model.pt"
     vae_ckpt = torch.load(vae_ckpt_path, map_location=device)
     encoder.load_state_dict(vae_ckpt['encoder_state_dict'])
     decoder.load_state_dict(vae_ckpt['decoder_state_dict'])
+    encoder = encoder.to(device)
+    decoder = decoder.to(device)
     encoder.eval()
     decoder.eval()
     for param in encoder.parameters():
@@ -158,7 +204,7 @@ def train():
         param.requires_grad = False
 
     diffusion = Diffusion().to(device)
-    sampler = DDPMSampler(torch.Generator(device = device).manual_seed(0))#.to(device)
+    sampler = DDPMSampler(torch.Generator(device=device).manual_seed(0))
 
     # Optimizer
     diffusion_optimizer = torch.optim.Adam(diffusion.parameters(), lr=lr, betas=(0.5, 0.999))
@@ -166,36 +212,36 @@ def train():
     # Load the best model if it exists
     print("load model")
     start_epoch, best_loss = load_checkpoint(model_path, diffusion, diffusion_optimizer, best_loss, device)
+    # diffusion = diffusion
 
     x_fixed, c_org, valence_org, arousal_org = next(iter(val_dataloader))
-    x_fixed = x_fixed.to(device)
-    c_fixed_list = create_labels(c_org, c_dim)
-    c_fixed_list = torch.stack(c_fixed_list).to(device)
+    # x_fixed = x_fixed.to(device)
 
     try:
         alpha = 0.1  # hệ số loss phụ
+        last_loss = None
         print("train")
         for epoch in range(start_epoch, num_epochs):
-            for i, (img_real, expr_org, valence_org, arousal_org) in enumerate(train_dataloader):
-                # Trộn nhãn (random target)
+            epoch_bar = tqdm(enumerate(train_dataloader), total=len(train_dataloader),
+                             desc=f"Epoch {epoch}/{num_epochs}")
+
+            for i, (img_real, expr_org, valence_org, arousal_org) in epoch_bar:
                 rand_idx = torch.randperm(expr_org.size(0))
                 label_trg = expr_org[rand_idx]
                 valence_trg = valence_org[rand_idx]
                 arousal_trg = arousal_org[rand_idx]
 
-                actual_batch_size = img_real.size(0)  # = 8
-                ic(img_real.size(0))
-                mini_batch_size = actual_batch_size // accumulation_steps  # = 2
+                actual_batch_size = img_real.size(0)
+                mini_batch_size = actual_batch_size // accumulation_steps
 
                 loss_accum = 0.0
-                valid_steps = 0  # Đếm số lần backward thực sự
+                valid_steps = 0
                 last_loss = None
                 last_mse_loss = None
 
                 for acc_i in range(accumulation_steps):
                     start_idx = acc_i * mini_batch_size
                     end_idx = (acc_i + 1) * mini_batch_size
-                    ic(start_idx, end_idx, acc_i, mini_batch_size)
                     mini_img = img_real[start_idx:end_idx].to(device)
                     mini_label = label_trg[start_idx:end_idx].to(device)
                     mini_val = valence_trg[start_idx:end_idx].to(device)
@@ -233,25 +279,33 @@ def train():
                     loss = mse_loss + alpha * (expr_loss + val_loss + aro_loss)
                     loss_accum += loss.item()
 
-                    last_loss = loss  # lưu lại loss cuối để log
+                    last_loss = loss
                     last_mse_loss = mse_loss
 
                     loss = loss / accumulation_steps
                     loss.backward()
                     valid_steps += 1
-                    ic(valid_steps)
+
+                    time.sleep(120)  # Tạm dừng theo thiết kế của bạn
+
                 if valid_steps > 0:
                     diffusion_optimizer.step()
                     diffusion_optimizer.zero_grad()
 
-                    print(f"[Epoch {epoch} Iter {i}] Avg Loss: {loss_accum:.4f}")
+                    epoch_bar.set_postfix({
+                        "Avg Loss": f"{loss_accum:.4f}",
+                        "MSE Loss": f"{last_mse_loss.item():.4f}" if last_mse_loss is not None else "N/A"
+                    })
 
                     if i % 10 == 0:
                         writer.add_scalar("Loss/Total", last_loss.item(), epoch * len(train_dataloader) + i)
                         writer.add_scalar("Loss/MSE", last_mse_loss.item(), epoch * len(train_dataloader) + i)
 
+                if i % 5 == 0:
+                    save_checkpoint(model_path, epoch, i, diffusion, diffusion_optimizer, last_loss)
+
                 # Save ảnh
-                if i % 500 == 0:
+                if i % 10 == 0:
                     print("➡️ [SAVE IMAGE] Bắt đầu sinh ảnh val...")
                     with torch.no_grad():
                         all_imgs = []
@@ -260,7 +314,7 @@ def train():
 
                         for idx in range(0, num_samples, mini_bs):
                             print(f"🔁 Sinh batch ảnh val nhỏ: từ {idx} đến {idx + mini_bs}")
-                            x_part = x_fixed[idx:idx + mini_bs]
+                            x_part = x_fixed[idx:idx + mini_bs].to(device)
                             noise = torch.randn(x_part.size(0), 4, 28, 28).to(torch.float32).to(device)
                             latent_fixed, _, _ = encoder(x_part, noise)
 
@@ -299,7 +353,8 @@ def train():
                         print("📦 [Tổng hợp ảnh xong] -> Lưu ảnh")
                         save_image(all_imgs, f"{out_path}/epoch{epoch}_iter{i}.png", nrow=4)
                         print(f"✅ [Ảnh đã lưu]: {out_path}/epoch{epoch}_iter{i}.png")
-
+                    print("dùng 300")
+                    time.sleep(300)
             if last_loss is not None:
                 save_checkpoint(model_path, epoch, i, diffusion, diffusion_optimizer, last_loss)
 
