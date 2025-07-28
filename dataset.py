@@ -116,7 +116,7 @@ def measure_load_time(dataset_class, dataset_name, root, is_train=True, transfor
     dataset = dataset_class(root=root, is_train=is_train, transform=transform)
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
 
-    print(f"/n⏳ Loading from {dataset_name}...")
+    print(f"/n⏳ Loading from s{dataset_name}...")
     start_time = time.time()
 
     total = 0
@@ -128,13 +128,65 @@ def measure_load_time(dataset_class, dataset_name, root, is_train=True, transfor
     print(f"✅ {dataset_name}: Loaded {total} samples in {duration:.2f} seconds")
 
 
-
-
 def cout(a):
     print("****************************")
     print(a)
     print(type(a))
     print("****************************")
+
+
+
+class AffectnetWavelet(Dataset):
+    def __init__(self, root, is_train, transform=None):
+        image_path = os.path.join(root, "LL_tensor")
+        self.transform = transform
+
+        if is_train:
+            label_path = os.path.join(root, "training.csv")
+        else:
+            label_path = os.path.join(root, "validation.csv")
+
+        list_label = pd.read_csv(label_path)
+        valid_labels = list_label[list_label['expression'] < 8].copy()
+
+        def to_tensor_path(x):
+            pt_path = x.replace(".jpg", ".pt").replace(".png", ".pt")
+            return os.path.join(image_path, pt_path)
+
+        valid_labels['full_tensor_path'] = valid_labels['subDirectory_filePath'].apply(to_tensor_path)
+
+        valid_labels = valid_labels[valid_labels['full_tensor_path'].apply(os.path.isfile)]
+
+        self.list_image = valid_labels['full_tensor_path'].tolist()
+        self.list_label_expression = valid_labels['expression'].tolist()
+        self.list_valence = valid_labels['valence'].tolist()
+        self.list_arousal = valid_labels['arousal'].tolist()
+        self.list_landmarks = valid_labels['facial_landmarks'].tolist()
+
+    def __len__(self):
+        return len(self.list_image)
+
+    def __getitem__(self, item):
+        try:
+            image_tensor = torch.load(self.list_image[item])
+
+            if self.transform:
+                image_tensor = self.transform(image_tensor)
+
+            expr = torch.tensor(self.list_label_expression[item], dtype=torch.long)
+            valence = torch.tensor(self.list_valence[item], dtype=torch.float32)
+            arousal = torch.tensor(self.list_arousal[item], dtype=torch.float32)
+
+            raw_landmarks = self.list_landmarks[item]
+            landmark_tensor = torch.tensor([float(x) for x in raw_landmarks.split(';')], dtype=torch.float32)
+
+            return image_tensor, expr, valence, arousal, landmark_tensor
+
+        except Exception as e:
+            print(f"Error loading sample {item}: {e}")
+            next_item = (item + 1) % len(self)
+            return self.__getitem__(next_item)
+
 
 if __name__ == '__main__':
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -177,12 +229,15 @@ if __name__ == '__main__':
     # )
 
     # transform = Normalize(mean=[0.5402, 0.4410, 0.3938], std=[0.2914, 0.2657, 0.2609])
-    dataset = AffectnetPt(root="chunks1024", is_train=False, transform=transform)
-    cout((dataset))
-    # cout(len(dataset[1][3]))
-    csv_root = "C:/Users/tam/Documents/data/Affectnet"  # thư mục chứa Manually_Annotated_Images, training.csv
-    pt_root = "chunks1024"  # thư mục chứa train/*.pt, val/*.pt
-
-    # So sánh tốc độ
-    measure_load_time(Affectnet, "AffectNet CSV + JPG", csv_root, is_train=True, transform=transform)
-    measure_load_time(AffectnetPt, "AffectNet .pt chunks", pt_root, is_train=True)
+    # dataset = AffectnetPt(root="chunks1024", is_train=False, transform=transform)
+    # cout((dataset))
+    # # cout(len(dataset[1][3]))
+    # csv_root = "C:/Users/tam/Documents/data/Affectnet"  # thư mục chứa Manually_Annotated_Images, training.csv
+    # pt_root = "chunks1024"  # thư mục chứa train/*.pt, val/*.pt
+    #
+    # # So sánh tốc độ
+    # measure_load_time(Affectnet, "AffectNet CSV + JPG", csv_root, is_train=True, transform=transform)
+    # measure_load_time(AffectnetPt, "AffectNet .pt chunks", pt_root, is_train=True)
+    dataset = AffectnetWavelet(root="C:/Users/tam/Documents/data/Affectnet", is_train=True)
+    print(len(dataset))
+    print(dataset[0])
