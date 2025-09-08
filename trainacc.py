@@ -222,64 +222,83 @@ def train():
                              desc=f"Epoch {epoch}/{num_epochs}")
 
             for i, (img_real, expr_org, valence_org, arousal_org) in epoch_bar:
-                img_real = img_real.to(device)
-                expr_org = expr_org.to(device)
-                valence_org = valence_org.to(device)
-                arousal_org = arousal_org.to(device)
-
-                # shuffle labels để tạo label target
                 rand_idx = torch.randperm(expr_org.size(0))
                 label_trg = expr_org[rand_idx]
                 valence_trg = valence_org[rand_idx]
                 arousal_trg = arousal_org[rand_idx]
 
-                # Encode ảnh thật
-                noise = torch.randn(img_real.size(0), 4, 16, 16).to(torch.float32).to(device)
-                with torch.no_grad():
-                    latent, _, _ = encoder(img_real, noise)
+                actual_batch_size = img_real.size(0)
+                mini_batch_size = actual_batch_size // accumulation_steps
 
-                # Padding nếu không chia hết cho 8
-                B, C, H, W = latent.shape
-                pad_h = (8 - H % 8) % 8
-                pad_w = (8 - W % 8) % 8
-                latent = F.pad(latent, (0, pad_w, 0, pad_h), mode='reflect')
+                loss_accum = 0.0
+                valid_steps = 0
+                last_loss = None
+                last_mse_loss = None
 
-                timestep = torch.randint(0, sampler.num_train_timesteps, (img_real.size(0),), device=device).long()
-                noisy_latent = sampler.add_noise(latent, timestep)
+                for acc_i in range(accumulation_steps):
+                    start_idx = acc_i * mini_batch_size
+                    end_idx = (acc_i + 1) * mini_batch_size
+                    mini_img = img_real[start_idx:end_idx].to(device)
+                    mini_label = label_trg[start_idx:end_idx].to(device)
+                    mini_val = valence_trg[start_idx:end_idx].to(device)
+                    mini_aro = arousal_trg[start_idx:end_idx].to(device)
 
-                pred_noise, expr_pred, val_pred, aro_pred = diffusion(
-                    latent=noisy_latent,
-                    expr_label=label_trg,
-                    valence=valence_trg,
-                    arousal=arousal_trg,
-                    time=timestep.unsqueeze(-1).float()
-                )
+                    if mini_img.size(0) == 0:
+                        continue
 
-                # Losses
-                mse_loss = nn.MSELoss()(pred_noise, torch.randn_like(pred_noise))
-                expr_loss = nn.CrossEntropyLoss()(expr_pred, label_trg)
-                val_loss = nn.MSELoss()(val_pred, valence_trg)
-                aro_loss = nn.MSELoss()(aro_pred, arousal_trg)
-                loss = mse_loss + alpha * (expr_loss + val_loss + aro_loss)
+                    noise = torch.randn(mini_img.size(0), 4, 16, 16).to(torch.float32).to(device)
+                    with torch.no_grad():
+                        latent, _, _ = encoder(mini_img, noise)
 
-                diffusion_optimizer.zero_grad()
-                loss.backward()
-                diffusion_optimizer.step()
+                    latent = latent.to(device)
+                    B, C, H, W = latent.shape
+                    pad_h = (8 - H % 8) % 8
+                    pad_w = (8 - W % 8) % 8
+                    latent = F.pad(latent, (0, pad_w, 0, pad_h), mode='reflect')
 
-                # Hiển thị thông số
-                epoch_bar.set_postfix({
-                    "Loss": f"{loss.item():.4f}",
-                    "MSE": f"{mse_loss.item():.4f}"
-                })
+                    timestep = torch.randint(0, sampler.num_train_timesteps, (mini_img.size(0),), device=device).long()
+                    noisy_latent = sampler.add_noise(latent, timestep)
 
-                # TensorBoard
-                if i % 10 == 0:
-                    writer.add_scalar("Loss/Total", loss.item(), epoch * len(train_dataloader) + i)
-                    writer.add_scalar("Loss/MSE", mse_loss.item(), epoch * len(train_dataloader) + i)
+                    pred_noise, expr_pred, val_pred, aro_pred = diffusion(
+                        latent=noisy_latent,
+                        expr_label=mini_label,
+                        valence=mini_val,
+                        arousal=mini_aro,
+                        time=timestep.unsqueeze(-1).float()
+                    )
 
-                # Save checkpoint
+                    mse_loss = nn.MSELoss()(pred_noise, torch.randn_like(pred_noise))
+                    expr_loss = nn.CrossEntropyLoss()(expr_pred, mini_label)
+                    val_loss = nn.MSELoss()(val_pred, mini_val)
+                    aro_loss = nn.MSELoss()(aro_pred, mini_aro)
+
+                    loss = mse_loss + alpha * (expr_loss + val_loss + aro_loss)
+                    loss_accum += loss.item()
+
+                    last_loss = loss
+                    last_mse_loss = mse_loss
+
+                    loss = loss / accumulation_steps
+                    loss.backward()
+                    valid_steps += 1
+
+                    # time.sleep(120)  # Tạm dừng theo thiết kế của bạn
+
+                if valid_steps > 0:
+                    diffusion_optimizer.step()
+                    diffusion_optimizer.zero_grad()
+
+                    epoch_bar.set_postfix({
+                        "Avg Loss": f"{loss_accum:.4f}",
+                        "MSE Loss": f"{last_mse_loss.item():.4f}" if last_mse_loss is not None else "N/A"
+                    })
+
+                    if i % 10 == 0:
+                        writer.add_scalar("Loss/Total", last_loss.item(), epoch * len(train_dataloader) + i)
+                        writer.add_scalar("Loss/MSE", last_mse_loss.item(), epoch * len(train_dataloader) + i)
+
                 if i % 5 == 0:
-                    save_checkpoint(model_path, epoch, i, diffusion, diffusion_optimizer, loss)
+                    save_checkpoint(model_path, epoch, i, diffusion, diffusion_optimizer, last_loss)
 
                 # Save ảnh
                 if i % 10 == 0:

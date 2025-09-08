@@ -11,7 +11,7 @@ from torchvision.transforms import Resize, ToTensor, Compose, Normalize
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from model import VAE_Encoder, VAE_Decoder, CLIP, Diffusion, DDPMSampler
-from dataset import Affectnet
+from dataset import AffectnetWavelet
 from pprint import pprint
 from icecream import ic
 import time
@@ -90,10 +90,10 @@ def train():
     max_duration = 11.5 * 60 * 60
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     labels = ["angry", "disgust", "fear","happy", "neutral", "sad", "surprise"]
-
-    log_dir = "VAE/runs/exp"
-    model_path = "VAE/model"
-    out_path = "VAE/out"
+    print(device)
+    log_dir = "VAEw/runs/exp"
+    model_path = "VAEw/model"
+    out_path = "VAEw/out"
 
     if os.path.exists(log_dir):
         shutil.rmtree(log_dir)
@@ -122,8 +122,9 @@ def train():
         Normalize(mean=[0.5402, 0.4410, 0.3938], std=[0.2914, 0.2657, 0.2609]),#tìm mean std
     ])
     # Data loader
+    print("data loader")
     # train_dataset = ImageFolder(root='/home/tam/Desktop/pythonProject1/archive/AffectNet/data', transform=transform)
-    train_dataset = Affectnet(root="C:/Users/tam/Documents/data/Affectnet", is_train=True, transform=transform)
+    train_dataset = AffectnetWavelet(root="C:/Users/tam/Documents/data/Affectnet", is_train=True)
     train_dataloader = DataLoader(
         dataset=train_dataset,
         batch_size=batch_size,
@@ -132,7 +133,7 @@ def train():
         drop_last=True
     )
 
-    val_dataset = Affectnet(root="C:/Users/tam/Documents/data/Affectnet", is_train=False, transform=transform)
+    val_dataset = AffectnetWavelet(root="C:/Users/tam/Documents/data/Affectnet", is_train=False)
     val_dataloader = DataLoader(
         dataset=val_dataset,
         batch_size=batch_size,
@@ -140,7 +141,8 @@ def train():
         shuffle=True,
         drop_last=True
     )
-
+    print(time.time())
+    print("model")
     # Models
     encoder = VAE_Encoder().to(device)
     decoder = VAE_Decoder().to(device)
@@ -155,16 +157,16 @@ def train():
     x_fixed = x_fixed.to(device)
     c_fixed_list = create_labels(c_org, c_dim)
     c_fixed_list = torch.stack(c_fixed_list).to(device)
-
+    print("train")
     try:
         for epoch in range(start_epoch, num_epochs):
             for i, (img_real, expr_org, valence_org, arousal_org) in enumerate(train_dataloader):
                 if time.time() - start_time > max_duration:
                     save_checkpoint(model_path, epoch, i, encoder, decoder, optimizer, loss)
                     return  # hoặc dùng break nếu bạn muốn thoát chỉ khỏi vòng lặp hiện tại
-
+                print(img_real.size())
                 img_real = img_real.to(device)
-                noise = torch.randn(1, 4, 28, 28).to(torch.float32).to(device)
+                noise = torch.randn(1, 4, 16, 16).to(torch.float32).to(device)
                 latent, mean, log_variance = encoder(img_real, noise)
                 recon_img = decoder(latent)
                 # Loss = MSE + KL

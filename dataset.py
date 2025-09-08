@@ -161,7 +161,7 @@ class AffectnetWavelet(Dataset):
         self.list_label_expression = valid_labels['expression'].tolist()
         self.list_valence = valid_labels['valence'].tolist()
         self.list_arousal = valid_labels['arousal'].tolist()
-        self.list_landmarks = valid_labels['facial_landmarks'].tolist()
+        # self.list_landmarks = valid_labels['facial_landmarks'].tolist()
 
     def __len__(self):
         return len(self.list_image)
@@ -169,7 +169,8 @@ class AffectnetWavelet(Dataset):
     def __getitem__(self, item):
         try:
             image_tensor = torch.load(self.list_image[item])
-
+            image_tensor = F.interpolate(image_tensor.unsqueeze(0), size=(128, 128), mode='bilinear',
+                                         align_corners=False).squeeze(0)
             if self.transform:
                 image_tensor = self.transform(image_tensor)
 
@@ -177,10 +178,10 @@ class AffectnetWavelet(Dataset):
             valence = torch.tensor(self.list_valence[item], dtype=torch.float32)
             arousal = torch.tensor(self.list_arousal[item], dtype=torch.float32)
 
-            raw_landmarks = self.list_landmarks[item]
-            landmark_tensor = torch.tensor([float(x) for x in raw_landmarks.split(';')], dtype=torch.float32)
+            # raw_landmarks = self.list_landmarks[item]
+            # landmark_tensor = torch.tensor([float(x) for x in raw_landmarks.split(';')], dtype=torch.float32)
 
-            return image_tensor, expr, valence, arousal, landmark_tensor
+            return image_tensor, expr, valence, arousal#, landmark_tensor
 
         except Exception as e:
             print(f"Error loading sample {item}: {e}")
