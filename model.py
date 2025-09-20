@@ -1,605 +1,442 @@
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import math
 import numpy as np
-from torch import nn
-from torch.nn import functional as F
-import cv2
-from icecream import ic
+
+
+class DWT(nn.Module):
+    """Discrete Wavelet Transform"""
+    def __init__(self):
+        super(DWT, self).__init__()
+        self.low = torch.tensor([1., 1.]) / math.sqrt(2)
+        self.high = torch.tensor([1., -1.]) / math.sqrt(2)
+
+    def forward(self, x):
+        """
+        Input: x (B, C, H, W)
+        Output: (B, 4*C, H/2, W/2) - [LL, LH, HL, HH] concatenated
+        """
+        B, C, H, W = x.shape
+        assert H % 2 == 0 and W % 2 == 0, "Height and Width must be even"
+        low = self.low.to(x.device)
+        high = self.high.to(x.device)
+
+        ll = torch.outer(low, low).unsqueeze(0).unsqueeze(0)  # (1, 1, 2, 2)
+        lh = torch.outer(low, high).unsqueeze(0).unsqueeze(0)
+        hl = torch.outer(high, low).unsqueeze(0).unsqueeze(0)
+        hh = torch.outer(high, high).unsqueeze(0).unsqueeze(0)
+
+        ll = ll.repeat(C, 1, 1, 1)  # (C, 1, 2, 2)
+        lh = lh.repeat(C, 1, 1, 1)
+        hl = hl.repeat(C, 1, 1, 1)
+        hh = hh.repeat(C, 1, 1, 1)
+
+        x_ll = F.conv2d(x, ll, stride=2, groups=C)
+        x_lh = F.conv2d(x, lh, stride=2, groups=C)
+        x_hl = F.conv2d(x, hl, stride=2, groups=C)
+        x_hh = F.conv2d(x, hh, stride=2, groups=C)
+
+        return torch.cat([x_ll, x_lh, x_hl, x_hh], dim=1)
+
+
+class IWT(nn.Module):
+    """Inverse Wavelet Transform"""
+    def __init__(self):
+        super(IWT, self).__init__()
+        self.low = torch.tensor([1., 1.]) / math.sqrt(2)
+        self.high = torch.tensor([1., -1.]) / math.sqrt(2)
+
+    def forward(self, x):
+        """
+        Input: x (B, 4*C, H, W) - [LL, LH, HL, HH] concatenated
+        Output: (B, C, 2*H, 2*W)
+        """
+        B, C4, H, W = x.shape
+        assert C4 % 4 == 0, "Channel dimension must be divisible by 4"
+        C = C4 // 4
+
+        x_ll = x[:, :C, :, :]
+        x_lh = x[:, C:2*C, :, :]
+        x_hl = x[:, 2*C:3*C, :, :]
+        x_hh = x[:, 3*C:, :, :]
+
+        low = self.low.to(x.device)
+        high = self.high.to(x.device)
+
+        ll = torch.outer(low, low).unsqueeze(0).unsqueeze(0) * 2  # (1, 1, 2, 2)
+        lh = torch.outer(low, high).unsqueeze(0).unsqueeze(0) * 2
+        hl = torch.outer(high, low).unsqueeze(0).unsqueeze(0) * 2
+        hh = torch.outer(high, high).unsqueeze(0).unsqueeze(0) * 2
+
+        ll = ll.repeat(C, 1, 1, 1)  # (C, 1, 2, 2)
+        lh = lh.repeat(C, 1, 1, 1)
+        hl = hl.repeat(C, 1, 1, 1)
+        hh = hh.repeat(C, 1, 1, 1)
+
+        x_ll_up = F.conv_transpose2d(x_ll, ll, stride=2, groups=C)
+        x_lh_up = F.conv_transpose2d(x_lh, lh, stride=2, groups=C)
+        x_hl_up = F.conv_transpose2d(x_hl, hl, stride=2, groups=C)
+        x_hh_up = F.conv_transpose2d(x_hh, hh, stride=2, groups=C)
+
+        return x_ll_up + x_lh_up + x_hl_up + x_hh_up
+
 
 class TimeEmbedding(nn.Module):
-    def __init__(self, n_embd):
+    """Positional encoding for timesteps"""
+    def __init__(self, dim):
         super().__init__()
-        self.linear_1 = nn.Linear(n_embd, 4 * n_embd)
-        self.linear_2 = nn.Linear(4 * n_embd, 4 * n_embd)
+        self.dim = dim
 
-    def forward(self, x):
-        x = self.linear_1(x)
-        x = F.silu(x)
-        x = self.linear_2(x)
-        return x
+    def forward(self, time):
+        device = time.device
+        half_dim = self.dim // 2
+        embeddings = math.log(10000) / (half_dim - 1)
+        embeddings = torch.exp(torch.arange(half_dim, device=device) * -embeddings)
+        embeddings = time[:, None] * embeddings[None, :]
+        embeddings = torch.cat((embeddings.sin(), embeddings.cos()), dim=-1)
+        return embeddings
 
-class UNET_ResidualBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, n_time=1280):
+
+class ResBlock(nn.Module):
+    """Residual block with time and emotion conditioning"""
+    def __init__(self, in_channels, out_channels, time_dim, emotion_dim, dropout=0.1):
         super().__init__()
-        self.groupnorm_feature = nn.GroupNorm(32, in_channels)
-        self.conv_feature = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
-        self.linear_time = nn.Linear(n_time, out_channels)
+        self.norm1 = nn.GroupNorm(8, in_channels)
+        self.conv1 = nn.Conv2d(in_channels, out_channels, 3, padding=1)
 
-        self.groupnorm_merged = nn.GroupNorm(32, out_channels)
-        self.conv_merged = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
+        self.time_mlp = nn.Linear(time_dim, out_channels)
+        self.emotion_mlp = nn.Linear(emotion_dim, out_channels)
 
-        if in_channels == out_channels:
-            self.residual_layer = nn.Identity()
+        self.norm2 = nn.GroupNorm(8, out_channels)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, 3, padding=1)
+
+        self.dropout = nn.Dropout(dropout)
+
+        if in_channels != out_channels:
+            self.shortcut = nn.Conv2d(in_channels, out_channels, 1)
         else:
-            self.residual_layer = nn.Conv2d(in_channels, out_channels, kernel_size=1, padding=0)
+            self.shortcut = nn.Identity()
 
-    def forward(self, feature, time):
-        residue = feature
-        feature = self.groupnorm_feature(feature)
-        feature = F.silu(feature)
-        feature = self.conv_feature(feature)
-        time = F.silu(time)
-        time = self.linear_time(time)
-        merged = feature + time.unsqueeze(-1).unsqueeze(-1)
-        merged = self.groupnorm_merged(merged)
-        merged = F.silu(merged)
-        merged = self.conv_merged(merged)
-        return merged + self.residual_layer(residue)
+    def forward(self, x, time_emb, emotion_emb):
+        h = self.norm1(x)
+        h = F.silu(h)
+        h = self.conv1(h)
 
-class UNET_AttentionBlock(nn.Module):
-    def __init__(self, n_head: int, n_embd: int, d_context=768):
+        time_out = self.time_mlp(F.silu(time_emb))[:, :, None, None]
+        emotion_out = self.emotion_mlp(F.silu(emotion_emb))[:, :, None, None]
+        h = h + time_out + emotion_out
+
+        h = self.norm2(h)
+        h = F.silu(h)
+        h = self.dropout(h)
+        h = self.conv2(h)
+
+        return h + self.shortcut(x)
+
+
+class FrequencyBottleneckBlock(nn.Module):
+    """Frequency bottleneck block - processes low-freq, passes high-freq"""
+    def __init__(self, channels, time_dim, emotion_dim):
         super().__init__()
-        channels = n_head * n_embd
-        self.groupnorm = nn.GroupNorm(32, channels, eps=1e-6)
-        self.conv_input = nn.Conv2d(channels, channels, kernel_size=1, padding=0)
-        self.layernorm_1 = nn.LayerNorm(channels)
-        self.attention_1 = SelfAttention(n_head, channels, in_proj_bias=False)
-        self.layernorm_2 = nn.LayerNorm(channels)
-        self.attention_2 = CrossAttention(n_head, channels, d_context, in_proj_bias=False)
-        self.layernorm_3 = nn.LayerNorm(channels)
-        self.linear_geglu_1 = nn.Linear(channels, 4 * channels * 2)
-        self.linear_geglu_2 = nn.Linear(4 * channels, channels)
+        self.dwt = DWT()
+        self.iwt = IWT()
 
-        self.conv_output = nn.Conv2d(channels, channels, kernel_size=1, padding=0)
+        self.low_freq_processor = nn.Sequential(
+            ResBlock(channels, channels, time_dim, emotion_dim),
+            ResBlock(channels, channels, time_dim, emotion_dim)
+        )
 
-    def forward(self, x, context):
-        residue_long = x
-        x = self.groupnorm(x)
-        x = self.conv_input(x)
-        n, c, h, w = x.shape
-        x = x.view((n, c, h * w))
-        x = x.transpose(-1, -2)
-        residue_short = x
-        x = self.layernorm_1(x)
-        x = self.attention_1(x)
-        x = x + residue_short
-        residue_short = x
-        x = self.layernorm_2(x)
-        x = self.attention_2(x, context)
-        x = x + residue_short
-        residue_short = x
-        x = self.layernorm_3(x)
-        x, gate = self.linear_geglu_1(x).chunk(2, dim=-1)
-        x = x * F.gelu(gate)
-        x = self.linear_geglu_2(x)
-        x = x + residue_short
-        x = x.transpose(-1, -2)
-        x = x.view((n, c, h, w))
-        return self.conv_output(x) + residue_long
+    def forward(self, x, time_emb, emotion_emb):
+        x_freq = self.dwt(x)  # (B, 4*C, H/2, W/2)
 
-class Upsample(nn.Module):
-    def __init__(self, channels):
+        C = x.shape[1]
+        x_ll = x_freq[:, :C, :, :]
+        x_hi = x_freq[:, C:, :, :]
+
+        x_ll_processed = x_ll
+        for layer in self.low_freq_processor:
+            x_ll_processed = layer(x_ll_processed, time_emb, emotion_emb)
+
+        x_freq_out = torch.cat([x_ll_processed, x_hi], dim=1)
+
+        return self.iwt(x_freq_out)
+
+
+class FreqAwareDownsample(nn.Module):
+    """Frequency-aware downsampling block"""
+    def __init__(self, in_channels, out_channels, time_dim, emotion_dim):
         super().__init__()
-        self.conv = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        self.dwt = DWT()
+        self.conv = nn.Conv2d(4 * in_channels, out_channels, 1)
+        self.norm = nn.GroupNorm(8, out_channels)
+
+        self.time_mlp = nn.Linear(time_dim, out_channels)
+        self.emotion_mlp = nn.Linear(emotion_dim, out_channels)
+
+    def forward(self, x, time_emb, emotion_emb):
+        x_freq = self.dwt(x)  # (B, 4*C, H/2, W/2)
+
+        out = self.conv(x_freq)
+        out = self.norm(out)
+
+        time_out = self.time_mlp(F.silu(time_emb))[:, :, None, None]
+        emotion_out = self.emotion_mlp(F.silu(emotion_emb))[:, :, None, None]
+        out = out + time_out + emotion_out
+
+        C = x.shape[1]
+        hi_freq = x_freq[:, C:, :, :]
+
+        return F.silu(out), hi_freq
+
+
+class FreqAwareUpsample(nn.Module):
+    """Frequency-aware upsampling block"""
+    def __init__(self, in_channels, out_channels, time_dim, emotion_dim):
+        super().__init__()
+        self.iwt = IWT()
+        self.conv = nn.Conv2d(in_channels, out_channels, 1)
+        self.norm = nn.GroupNorm(8, out_channels)
+
+        self.time_mlp = nn.Linear(time_dim, out_channels)
+        self.emotion_mlp = nn.Linear(emotion_dim, out_channels)
+
+    def forward(self, x, hi_freq_skip, time_emb, emotion_emb):
+        x_low = self.conv(x)
+        x_low = self.norm(x_low)
+
+        time_out = self.time_mlp(F.silu(time_emb))[:, :, None, None]
+        emotion_out = self.emotion_mlp(F.silu(emotion_emb))[:, :, None, None]
+        x_low = x_low + time_out + emotion_out
+        x_low = F.silu(x_low)
+
+        x_freq = torch.cat([x_low, hi_freq_skip], dim=1)
+
+        return self.iwt(x_freq)
+
+
+class WaveletResidualConnection(nn.Module):
+    """Frequency residual connection using wavelet downsample"""
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.dwt = DWT()
+        self.conv = nn.Conv2d(4 * in_channels, out_channels, 1)
 
     def forward(self, x):
-        x = F.interpolate(x, scale_factor=2, mode='nearest')
-        return self.conv(x)
+        x_freq = self.dwt(x)  # (B, 4*C, H/2, W/2)
+        return self.conv(x_freq)
 
-class SwitchSequential(nn.Sequential):
-    def forward(self, x, context, time):
-        for layer in self:
-            if isinstance(layer, UNET_AttentionBlock):
-                x = layer(x, context)
-            elif isinstance(layer, UNET_ResidualBlock):
-                x = layer(x, time)
-            else:
-                x = layer(x)
-        return x
 
-class UNET(nn.Module):
-    def __init__(self):
+class WaveletUNet(nn.Module):
+    """Wavelet-embedded U-Net for emotion-conditioned diffusion"""
+    def __init__(self,
+                 in_channels=12,
+                 out_channels=12,
+                 features=[64, 128, 256, 512],
+                 time_dim=256,
+                 emotion_dim=64,
+                 num_emotions=8):
         super().__init__()
-        self.encoders = nn.ModuleList([
-            SwitchSequential(nn.Conv2d(4, 320, kernel_size=3, padding=1)),
-            SwitchSequential(UNET_ResidualBlock(320, 320), UNET_AttentionBlock(8, 40)),
-            SwitchSequential(UNET_ResidualBlock(320, 320), UNET_AttentionBlock(8, 40)),
-            SwitchSequential(nn.Conv2d(320, 320, kernel_size=3, stride=2, padding=1)),
-            SwitchSequential(UNET_ResidualBlock(320, 640), UNET_AttentionBlock(8, 80)),
-            SwitchSequential(UNET_ResidualBlock(640, 640), UNET_AttentionBlock(8, 80)),
-            SwitchSequential(nn.Conv2d(640, 640, kernel_size=3, stride=2, padding=1)),
-            SwitchSequential(UNET_ResidualBlock(640, 1280), UNET_AttentionBlock(8, 160)),
-            SwitchSequential(UNET_ResidualBlock(1280, 1280), UNET_AttentionBlock(8, 160)),
-            SwitchSequential(nn.Conv2d(1280, 1280, kernel_size=3, stride=2, padding=1)),
-            SwitchSequential(UNET_ResidualBlock(1280, 1280)),
-            SwitchSequential(UNET_ResidualBlock(1280, 1280)),
-        ])
 
-        self.bottleneck = SwitchSequential(
-            UNET_ResidualBlock(1280, 1280),
-            UNET_AttentionBlock(8, 160),
-            UNET_ResidualBlock(1280, 1280),
+        self.time_embedding = TimeEmbedding(time_dim)
+        self.emotion_embedding = nn.Embedding(num_emotions, emotion_dim)
+
+        self.input_conv = nn.Conv2d(in_channels, features[0], 3, padding=1)
+
+        self.aux_expr_head = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(features[-1], 128),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(128, num_emotions)
         )
-        self.decoders = nn.ModuleList([
-            SwitchSequential(UNET_ResidualBlock(2560, 1280)),
-            SwitchSequential(UNET_ResidualBlock(2560, 1280)),
-            SwitchSequential(UNET_ResidualBlock(2560, 1280), Upsample(1280)),
-            SwitchSequential(UNET_ResidualBlock(2560, 1280), UNET_AttentionBlock(8, 160)),
-            SwitchSequential(UNET_ResidualBlock(2560, 1280), UNET_AttentionBlock(8, 160)),
-            SwitchSequential(UNET_ResidualBlock(1920, 1280), UNET_AttentionBlock(8, 160), Upsample(1280)),
-            SwitchSequential(UNET_ResidualBlock(1920, 640), UNET_AttentionBlock(8, 80)),
-            SwitchSequential(UNET_ResidualBlock(1280, 640), UNET_AttentionBlock(8, 80)),
-            SwitchSequential(UNET_ResidualBlock(960, 640), UNET_AttentionBlock(8, 80), Upsample(640)),
-            SwitchSequential(UNET_ResidualBlock(960, 320), UNET_AttentionBlock(8, 40)),
-            SwitchSequential(UNET_ResidualBlock(640, 320), UNET_AttentionBlock(8, 40)),
-            SwitchSequential(UNET_ResidualBlock(640, 320), UNET_AttentionBlock(8, 40)),
+
+        self.aux_va_head = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(features[-1], 128),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(128, 2)  # valence, arousal
+        )
+
+        self.encoder_blocks = nn.ModuleList()
+        self.downsample_blocks = nn.ModuleList()
+
+        for i in range(len(features) - 1):
+            self.encoder_blocks.append(nn.ModuleList([
+                ResBlock(features[i], features[i], time_dim, emotion_dim),
+                ResBlock(features[i], features[i], time_dim, emotion_dim)
+            ]))
+
+            self.downsample_blocks.append(
+                FreqAwareDownsample(features[i], features[i+1], time_dim, emotion_dim)
+            )
+
+        self.bottleneck = nn.ModuleList([
+            FrequencyBottleneckBlock(features[-1], time_dim, emotion_dim),
+            ResBlock(features[-1], features[-1], time_dim, emotion_dim),
+            FrequencyBottleneckBlock(features[-1], time_dim, emotion_dim)
         ])
 
-    def forward(self, x, context, time):
-        # x: (Batch_Size, 4, Height / 8, Width / 8)
-        # context: (Batch_Size, Seq_Len, Dim)
-        # time: (1, 1280)
+        self.decoder_blocks = nn.ModuleList()
+        self.upsample_blocks = nn.ModuleList()
 
+        for i in range(len(features) - 1, 0, -1):
+            self.upsample_blocks.append(
+                FreqAwareUpsample(features[i], features[i-1], time_dim, emotion_dim)
+            )
+
+            self.decoder_blocks.append(nn.ModuleList([
+                ResBlock(features[i-1] * 2, features[i-1], time_dim, emotion_dim),  # *2 for skip connection
+                ResBlock(features[i-1], features[i-1], time_dim, emotion_dim)
+            ]))
+
+        self.output_conv = nn.Sequential(
+            nn.GroupNorm(8, features[0]),
+            nn.SiLU(),
+            nn.Conv2d(features[0], out_channels, 3, padding=1)
+        )
+
+    def forward(self, x, t, emotion_id, src_image=None, return_aux=False):
+        """
+        Args:
+            x: Noisy wavelet coefficients (B, 12, H/2, W/2)
+            t: Timestep (B,)
+            emotion_id: Target emotion ID (B,)
+            src_image: Source RGB image for residual connections (B, 3, H, W)
+            return_aux: Whether to return auxiliary predictions
+        """
+        time_emb = self.time_embedding(t)
+        emotion_emb = self.emotion_embedding(emotion_id)
+
+        x = self.input_conv(x)
         skip_connections = []
-        for layers in self.encoders:
-            x = layers(x, context, time)
+        hi_freq_skips = []
+
+        for i, (encoder_block, downsample_block) in enumerate(
+            zip(self.encoder_blocks, self.downsample_blocks)
+        ):
+            for block in encoder_block:
+                x = block(x, time_emb, emotion_emb)
+
             skip_connections.append(x)
 
-        x = self.bottleneck(x, context, time)
+            x, hi_freq = downsample_block(x, time_emb, emotion_emb)
+            hi_freq_skips.append(hi_freq)
 
-        for layers in self.decoders:
-            x = torch.cat((x, skip_connections.pop()), dim=1)
-            x = layers(x, context, time)
+        bottleneck_features = x
+        for block in self.bottleneck:
+            if isinstance(block, FrequencyBottleneckBlock):
+                x = block(x, time_emb, emotion_emb)
+            else:
+                x = block(x, time_emb, emotion_emb)
 
-        return x
+        aux_features = x
 
-class UNET_OutputLayer(nn.Module):
-    def __init__(self, in_channels, out_channels):
+        for i, (upsample_block, decoder_block) in enumerate(
+            zip(self.upsample_blocks, self.decoder_blocks)
+        ):
+            hi_freq = hi_freq_skips[-(i+1)]
+            x = upsample_block(x, hi_freq, time_emb, emotion_emb)
+
+            skip = skip_connections[-(i+1)]
+            x = torch.cat([x, skip], dim=1)
+
+            for block in decoder_block:
+                x = block(x, time_emb, emotion_emb)
+
+        noise_pred = self.output_conv(x)
+
+        if return_aux:
+            expr_pred = self.aux_expr_head(aux_features)
+            va_pred = self.aux_va_head(aux_features)
+            return noise_pred, expr_pred, va_pred
+
+        return noise_pred
+
+
+class WaveletDiffusionModel(nn.Module):
+    """Complete Wavelet Diffusion Model for Emotion Editing"""
+    def __init__(self,
+                 num_emotions=8,
+                 num_timesteps=1000,
+                 beta_start=1e-4,
+                 beta_end=2e-2):
         super().__init__()
-        self.groupnorm = nn.GroupNorm(32, in_channels)
-        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
 
-    def forward(self, x):
-        x = self.groupnorm(x)
-        x = F.silu(x)
-        x = self.conv(x)
-        return x
+        self.num_timesteps = num_timesteps
+        self.num_emotions = num_emotions
 
-class Diffusion(nn.Module):
-    def __init__(self):
-        super().__init__()
-        # 1) Project timestep scalar → 320-d
-        self.time_proj = nn.Sequential(
-            nn.Linear(1, 320),
-            nn.SiLU(),
-        )
-        # 2) Expand to 1280-d
-        self.time_embedding = TimeEmbedding(320)
+        self.dwt = DWT()
+        self.iwt = IWT()
 
-        # Context: expr label + valence/arousal
-        self.expr_embedding = nn.Embedding(8, 128)
-        self.va_proj = nn.Sequential(
-            nn.Linear(2, 128),
-            nn.SiLU(),
-            nn.Linear(128, 128)
-        )
-        self.context_proj = nn.Linear(256, 768)
+        self.unet = WaveletUNet(num_emotions=num_emotions)
 
-        # UNet + output
-        self.unet = UNET()
-        self.final = UNET_OutputLayer(320, 4)
+        betas = torch.linspace(beta_start, beta_end, num_timesteps)
+        alphas = 1.0 - betas
+        alphas_cumprod = torch.cumprod(alphas, dim=0)
 
-        # Auxiliary heads
-        self.expr_head = nn.Linear(320, 8)
-        self.val_head = nn.Linear(320, 1)
-        self.aro_head = nn.Linear(320, 1)
+        self.register_buffer('betas', betas)
+        self.register_buffer('alphas', alphas)
+        self.register_buffer('alphas_cumprod', alphas_cumprod)
+        self.register_buffer('sqrt_alphas_cumprod', torch.sqrt(alphas_cumprod))
+        self.register_buffer('sqrt_one_minus_alphas_cumprod', torch.sqrt(1.0 - alphas_cumprod))
 
-    def get_context(self, expr_label, valence, arousal):
-        expr_emb = self.expr_embedding(expr_label)                  # (B,128)
-        va_emb = self.va_proj(torch.stack([valence, arousal], 1))  # (B,128)
-        ctx = torch.cat([expr_emb, va_emb], dim=1)                  # (B,256)
-        return self.context_proj(ctx)                              # (B,768)
+    def forward_process(self, x0, t, noise=None):
+        """Forward diffusion process - add noise"""
+        if noise is None:
+            noise = torch.randn_like(x0)
 
-    def forward(self, latent, expr_label, valence, arousal, time):
-        # context embedding
-        context = self.get_context(expr_label, valence, arousal)    # (B,768)
-        # time embedding
-        t = self.time_proj(time)                                    # (B,320)
-        t = self.time_embedding(t)                                  # (B,1280)
+        sqrt_alphas_cumprod_t = self.sqrt_alphas_cumprod[t][:, None, None, None]
+        sqrt_one_minus_alphas_cumprod_t = self.sqrt_one_minus_alphas_cumprod[t][:, None, None, None]
 
-        # UNet denoising
-        features = self.unet(latent, context, t)                    # (B,320,H,W)
-        pred_noise = self.final(features)                           # (B,4,H,W)
+        return sqrt_alphas_cumprod_t * x0 + sqrt_one_minus_alphas_cumprod_t * noise, noise
 
-        # auxiliary predictions
-        gf = features.mean(dim=(2,3))                               # (B,320)
-        expr_pred = self.expr_head(gf)                              # (B,8)
-        val_pred = self.val_head(gf).squeeze(1)                     # (B,)
-        aro_pred = self.aro_head(gf).squeeze(1)                     # (B,)
+    def forward(self, x, emotion_id, src_image=None):
+        """Training forward pass"""
+        x_wavelet = self.dwt(x)  # (B, 12, H/2, W/2)
+        t = torch.randint(0, self.num_timesteps, (x.shape[0],), device=x.device)
+        x_noisy, noise = self.forward_process(x_wavelet, t)
+        noise_pred = self.unet(x_noisy, t, emotion_id, src_image)
+        loss = F.l1_loss(noise_pred, noise)
+        return loss
 
-        return pred_noise, expr_pred, val_pred, aro_pred
+    @torch.no_grad()
+    def sample(self, src_image, target_emotion_id, num_steps=50):
+        """DDIM sampling for inference - Fixed implementation"""
+        device = src_image.device
+        B = src_image.shape[0]
+        src_wavelet = self.dwt(src_image)
+        x = torch.randn_like(src_wavelet)
+        timesteps = torch.linspace(self.num_timesteps - 1, 0, num_steps, dtype=torch.long, device=device)
 
+        for i, t in enumerate(timesteps):
+            t_tensor = torch.full((B,), t.item(), device=device, dtype=torch.long)
+            noise_pred = self.unet(x, t_tensor, target_emotion_id, src_image)
+            alpha_t = self.alphas_cumprod[t.item()]
+            alpha_prev = self.alphas_cumprod[timesteps[i+1].item()] if i < len(timesteps) - 1 else torch.tensor(1.0, device=device)
+            alpha_t = alpha_t.to(device)
+            alpha_prev = alpha_prev.to(device)
+            pred_x0 = (x - torch.sqrt(1 - alpha_t) * noise_pred) / torch.sqrt(alpha_t)
+            pred_x0 = torch.clamp(pred_x0, -3, 3)
 
+            if i < len(timesteps) - 1:
+                x = torch.sqrt(alpha_prev) * pred_x0 + torch.sqrt(1 - alpha_prev) * noise_pred
+            else:
+                x = pred_x0
 
-class DDPMSampler:
-    def __init__(self, generator: torch.Generator, num_training_steps=1000, beta_start: float = 0.00085,
-                 beta_end: float = 0.0120):
-        self.betas = torch.linspace(beta_start ** 0.5, beta_end ** 0.5, num_training_steps, dtype=torch.float32) ** 2
-        self.alphas = 1.0 - self.betas
-        self.alphas_cumprod = torch.cumprod(self.alphas, dim=0)
-        self.one = torch.tensor(1.0)
-        self.generator = generator
-        self.num_train_timesteps = num_training_steps
-        self.timesteps = torch.from_numpy(np.arange(0, num_training_steps)[::-1].copy())
-
-    def set_inference_timesteps(self, num_inference_steps=50):
-        self.num_inference_steps = num_inference_steps
-        step_ratio = self.num_train_timesteps // self.num_inference_steps
-        timesteps = (np.arange(0, num_inference_steps) * step_ratio).round()[::-1].copy().astype(np.int64)
-        self.timesteps = torch.from_numpy(timesteps)
-
-    def _get_previous_timestep(self, timestep: int) -> int:
-        prev_t = timestep - self.num_train_timesteps // self.num_inference_steps
-        return prev_t
-
-    def _get_variance(self, timestep: int) -> torch.Tensor:
-        prev_t = self._get_previous_timestep(timestep)
-        alpha_prod_t = self.alphas_cumprod[timestep]
-        alpha_prod_t_prev = self.alphas_cumprod[prev_t] if prev_t >= 0 else self.one
-        current_beta_t = 1 - alpha_prod_t / alpha_prod_t_prev
-        variance = (1 - alpha_prod_t_prev) / (1 - alpha_prod_t) * current_beta_t
-        variance = torch.clamp(variance, min=1e-20)
-        return variance
-
-    def set_strength(self, strength=1):
-        start_step = self.num_inference_steps - int(self.num_inference_steps * strength)
-        self.timesteps = self.timesteps[start_step:]
-        self.start_step = start_step
-
-    def step(self, timestep: int, latents: torch.Tensor, model_output: torch.Tensor):
-        t = timestep
-        prev_t = self._get_previous_timestep(t)
-
-        alpha_prod_t = self.alphas_cumprod[t]
-        alpha_prod_t_prev = self.alphas_cumprod[prev_t] if prev_t >= 0 else self.one
-        beta_prod_t = 1 - alpha_prod_t
-        beta_prod_t_prev = 1 - alpha_prod_t_prev
-        current_alpha_t = alpha_prod_t / alpha_prod_t_prev
-        current_beta_t = 1 - current_alpha_t
-        pred_original_sample = (latents - beta_prod_t ** (0.5) * model_output) / alpha_prod_t ** (0.5)
-        pred_original_sample_coeff = (alpha_prod_t_prev ** (0.5) * current_beta_t) / beta_prod_t
-        current_sample_coeff = current_alpha_t ** (0.5) * beta_prod_t_prev / beta_prod_t
-        pred_prev_sample = pred_original_sample_coeff * pred_original_sample + current_sample_coeff * latents
-        variance = 0
-        if t > 0:
-            device = model_output.device
-            noise = torch.randn(model_output.shape, generator=self.generator, device=device, dtype=model_output.dtype)
-            variance = (self._get_variance(t) ** 0.5) * noise
-
-        pred_prev_sample = pred_prev_sample + variance
-
-        return pred_prev_sample
-
-    def add_noise(
-            self,
-            original_samples: torch.FloatTensor,
-            timesteps: torch.IntTensor,
-    ) -> torch.FloatTensor:
-        alphas_cumprod = self.alphas_cumprod.to(device=original_samples.device, dtype=original_samples.dtype)
-        timesteps = timesteps.to(original_samples.device)
-
-        sqrt_alpha_prod = alphas_cumprod[timesteps] ** 0.5
-        sqrt_alpha_prod = sqrt_alpha_prod.flatten()
-        while len(sqrt_alpha_prod.shape) < len(original_samples.shape):
-            sqrt_alpha_prod = sqrt_alpha_prod.unsqueeze(-1)
-
-        sqrt_one_minus_alpha_prod = (1 - alphas_cumprod[timesteps]) ** 0.5
-        sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.flatten()
-        while len(sqrt_one_minus_alpha_prod.shape) < len(original_samples.shape):
-            sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.unsqueeze(-1)
-
-        noise = torch.randn(original_samples.shape, generator=self.generator, device=original_samples.device, dtype=original_samples.dtype)
-        noisy_samples = sqrt_alpha_prod * original_samples + sqrt_one_minus_alpha_prod * noise
-        return noisy_samples
-
-class CLIPEmbedding(nn.Module):
-    def __init__(self, n_vocab: int, n_embd: int, n_token: int):
-        super().__init__()
-        self.token_embedding = nn.Embedding(n_vocab, n_embd)
-        self.position_embedding = nn.Parameter(torch.zeros((n_token, n_embd)))
-
-    def forward(self, tokens):
-        x = self.token_embedding(tokens)
-        x = x + self.position_embedding
-        return x
-
-class CLIPLayer(nn.Module):
-    def __init__(self, n_head: int, n_embd: int):
-        super().__init__()
-        self.layernorm_1 = nn.LayerNorm(n_embd)
-        self.attention = SelfAttention(n_head, n_embd)
-        self.layernorm_2 = nn.LayerNorm(n_embd)
-        self.linear_1 = nn.Linear(n_embd, 4 * n_embd)
-        self.linear_2 = nn.Linear(4 * n_embd, n_embd)
-
-    def forward(self, x):
-        residue = x
-        x = self.layernorm_1(x)
-        x = self.attention(x, causal_mask=True)
-        x = x + residue
-        residue = x
-        x = self.layernorm_2(x)
-        x = self.linear_1(x)
-        x = x * torch.sigmoid(1.702 * x)
-        x = self.linear_2(x)
-        x = x + residue
-        return x
-
-class CLIP(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.embedding = CLIPEmbedding(49408, 768, 77)
-        self.layers = nn.ModuleList([
-            CLIPLayer(12, 768) for i in range(12)
-        ])
-        self.layernorm = nn.LayerNorm(768)
-
-    def forward(self, tokens: torch.LongTensor) -> torch.FloatTensor:
-        tokens = tokens.type(torch.long)
-        state = self.embedding(tokens)
-        for layer in self.layers:
-            state = layer(state)
-        output = self.layernorm(state)
-        return output
-
-class VAE_AttentionBlock(nn.Module):
-    def __init__(self, channels):
-        super().__init__()
-        self.groupnorm = nn.GroupNorm(32, channels)
-        self.attention = SelfAttention(1, channels)
-
-    def forward(self, x):
-        residue = x
-        x = self.groupnorm(x)
-        n, c, h, w = x.shape
-        x = x.view((n, c, h * w))
-        x = x.transpose(-1, -2)
-        x = self.attention(x)
-        x = x.transpose(-1, -2)
-        x = x.view((n, c, h, w))
-        x = x + residue
-        return x
-
-class VAE_ResidualBlock(nn.Module):
-    def __init__(self, in_channels, out_channels):
-        super().__init__()
-        self.groupnorm_1 = nn.GroupNorm(32, in_channels)
-        self.conv_1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
-
-        self.groupnorm_2 = nn.GroupNorm(32, out_channels)
-        self.conv_2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
-
-        if in_channels == out_channels:
-            self.residual_layer = nn.Identity()
-        else:
-            self.residual_layer = nn.Conv2d(in_channels, out_channels, kernel_size=1, padding=0)
-
-    def forward(self, x):
-        residue = x
-        x = self.groupnorm_1(x)
-        x = F.silu(x)
-        x = self.conv_1(x)
-        x = self.groupnorm_2(x)
-        x = F.silu(x)
-        x = self.conv_2(x)
-        return x + self.residual_layer(residue)
-
-class VAE_Decoder(nn.Sequential):
-    def __init__(self):
-        super().__init__(
-            nn.Conv2d(4, 4, kernel_size=1, padding=0),
-            nn.Conv2d(4, 512, kernel_size=3, padding=1),
-            VAE_ResidualBlock(512, 512),
-            VAE_AttentionBlock(512),
-            VAE_ResidualBlock(512, 512),
-            VAE_ResidualBlock(512, 512),
-            VAE_ResidualBlock(512, 512),
-            VAE_ResidualBlock(512, 512),
-            nn.Upsample(scale_factor=2),
-            nn.Conv2d(512, 512, kernel_size=3, padding=1),
-            VAE_ResidualBlock(512, 512),
-            VAE_ResidualBlock(512, 512),
-            VAE_ResidualBlock(512, 512),
-            nn.Upsample(scale_factor=2),
-            nn.Conv2d(512, 512, kernel_size=3, padding=1),
-            VAE_ResidualBlock(512, 256),
-            VAE_ResidualBlock(256, 256),
-            VAE_ResidualBlock(256, 256),
-            nn.Upsample(scale_factor=2),
-            nn.Conv2d(256, 256, kernel_size=3, padding=1),
-            VAE_ResidualBlock(256, 128),
-            VAE_ResidualBlock(128, 128),
-            VAE_ResidualBlock(128, 128),
-            nn.GroupNorm(32, 128),
-            nn.SiLU(),
-            nn.Conv2d(128, 3, kernel_size=3, padding=1),
-        )
-
-    def forward(self, x):
-        x = x / 0.18215
-        for module in self:
-            x = module(x)
-        return x
-
-class VAE_Encoder(nn.Sequential):
-    def __init__(self):
-        super().__init__(
-            nn.Conv2d(3, 128, kernel_size=3, padding=1),
-            VAE_ResidualBlock(128, 128),
-            VAE_ResidualBlock(128, 128),
-            nn.Conv2d(128, 128, kernel_size=3, stride=2, padding=0),
-            VAE_ResidualBlock(128, 256),
-            VAE_ResidualBlock(256, 256),
-            nn.Conv2d(256, 256, kernel_size=3, stride=2, padding=0),
-            VAE_ResidualBlock(256, 512),
-            VAE_ResidualBlock(512, 512),
-            nn.Conv2d(512, 512, kernel_size=3, stride=2, padding=0),
-            VAE_ResidualBlock(512, 512),
-            VAE_ResidualBlock(512, 512),
-            VAE_ResidualBlock(512, 512),
-            VAE_AttentionBlock(512),
-            VAE_ResidualBlock(512, 512),
-            nn.GroupNorm(32, 512),
-            nn.SiLU(),
-            nn.Conv2d(512, 8, kernel_size=3, padding=1),
-            nn.Conv2d(8, 8, kernel_size=1, padding=0),
-        )
-
-    def forward(self, x, noise):
-        for module in self:
-            if getattr(module, 'stride', None) == (2, 2):
-                x = F.pad(x, (0, 1, 0, 1))
-            # ic(type(module), module)
-            x = module(x)
-        mean, log_variance = torch.chunk(x, 2, dim=1)
-        log_variance = torch.clamp(log_variance, -30, 20)
-        variance = log_variance.exp()
-        stdev = variance.sqrt()
-        x = mean + stdev * noise
-        x = x * 0.18215
-        return x, mean, log_variance
-
-class SelfAttention(nn.Module):
-    def __init__(self, n_heads, d_embed, in_proj_bias=True, out_proj_bias=True):
-        super().__init__()
-        self.in_proj = nn.Linear(d_embed, 3 * d_embed, bias=in_proj_bias)
-        self.out_proj = nn.Linear(d_embed, d_embed, bias=out_proj_bias)
-        self.n_heads = n_heads
-        self.d_head = d_embed // n_heads
-
-    def forward(self, x, causal_mask=False):
-        input_shape = x.shape
-        batch_size, sequence_length, d_embed = input_shape
-        interim_shape = (batch_size, sequence_length, self.n_heads, self.d_head)
-        q, k, v = self.in_proj(x).chunk(3, dim=-1)
-        q = q.view(interim_shape).transpose(1, 2)
-        k = k.view(interim_shape).transpose(1, 2)
-        v = v.view(interim_shape).transpose(1, 2)
-        weight = q @ k.transpose(-1, -2)
-
-        if causal_mask:
-            mask = torch.ones_like(weight, dtype=torch.bool).triu(1)
-            weight.masked_fill_(mask, -torch.inf)
-
-        weight = weight / math.sqrt(self.d_head)
-        weight = F.softmax(weight, dim=-1)
-        output = weight @ v
-        output = output.transpose(1, 2)
-        output = output.reshape(input_shape)
-        output = self.out_proj(output)
-        return output
-
-class CrossAttention(nn.Module):
-    def __init__(self, n_heads, d_embed, d_cross, in_proj_bias=True, out_proj_bias=True):
-        super().__init__()
-        self.q_proj = nn.Linear(d_embed, d_embed, bias=in_proj_bias)
-        self.k_proj = nn.Linear(d_cross, d_embed, bias=in_proj_bias)
-        self.v_proj = nn.Linear(d_cross, d_embed, bias=in_proj_bias)
-        self.out_proj = nn.Linear(d_embed, d_embed, bias=out_proj_bias)
-        self.n_heads = n_heads
-        self.d_head = d_embed // n_heads
-
-    def forward(self, x, y):
-        input_shape = x.shape
-        batch_size, sequence_length, d_embed = input_shape
-        interim_shape = (batch_size, -1, self.n_heads, self.d_head)
-        q = self.q_proj(x)
-        k = self.k_proj(y)
-        v = self.v_proj(y)
-        q = q.view(interim_shape).transpose(1, 2)
-        k = k.view(interim_shape).transpose(1, 2)
-        v = v.view(interim_shape).transpose(1, 2)
-        weight = q @ k.transpose(-1, -2)
-        weight = weight / math.sqrt(self.d_head)
-        weight = F.softmax(weight, dim=-1)
-        output = weight @ v
-        output = output.transpose(1, 2).contiguous()
-        output = output.view(input_shape)
-        output = self.out_proj(output)
-        return output
-
-if __name__ == '__main__':
-    # time_embed = TimeEmbedding(320)
-    # t_input = torch.randn(1, 320)  # (Batch=1, Embedding dim=320)
-    #
-    # out = time_embed(t_input)
-    # print("Output shape:", out.shape)
-    # print("Output:", out)
+        result = self.iwt(x)
+        return torch.clamp(result, -1, 1)
 
 
+def create_wavelet_diffusion_model(num_emotions=7):
+    """Factory function to create the model"""
+    return WaveletDiffusionModel(num_emotions=num_emotions)
 
-    img = cv2.imread("1.jpg")
-    print(img.shape)
-    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    img = img / 255.0
-    img = torch.from_numpy(img).permute(2, 0, 1).to(torch.float32)
-    print("Input shape:", img.shape)
-    img = img.unsqueeze(0)
-    noise = torch.randn(1, 4, 50, 50).to(torch.float32)
-    print(img.shape)
-    encode = VAE_Encoder()
-    code = encode(img, noise)
-    print(code.shape)
-    decode = VAE_Decoder()
-    img = decode(code)
-    print(img.shape)
-    img = img.squeeze(0)
-    print(img.shape)
-    img = img.permute(1, 2, 0).detach().numpy()
-    cv2.imshow("img", img)
-    cv2.waitKey(0)
 
-    from model import DDPMSampler
-    from PIL import Image
-    import torch
-    import numpy as np
-    import matplotlib.pyplot as plt
-
-    generator = torch.Generator().manual_seed(0)
-    sampler = DDPMSampler(generator=generator)
-
-    img = Image.open("1.jpg").convert("RGB")
-    img_np = np.array(img)
-    img_tensor = torch.tensor(img_np, dtype=torch.float32).permute(2, 0, 1)  # (C, H, W)
-    img_tensor = ((img_tensor / 255.0) * 2.0) - 1.0  # Chuẩn hóa [-1, 1]
-    img_tensor = img_tensor.unsqueeze(0)  # (1, C, H, W)
-
-    noise_levels = [0, 10, 50, 100, 250, 500, 750]
-    timesteps = torch.tensor(noise_levels, dtype=torch.long)
-
-    batch = img_tensor.repeat(len(noise_levels), 1, 2, 2)  # (B, C, H, W)
-
-    noised_imgs = sampler.add_noise(batch, timesteps)  # (B, C, H, W)
-
-    noised_imgs = (noised_imgs.clamp(-1, 1) + 1) / 2
-    noised_imgs = (noised_imgs * 255).type(torch.uint8).permute(0, 2, 3, 1)  # (B, H, W, C)
-
-    plt.figure(figsize=(20, 4))
-    for i, t in enumerate(noise_levels):
-        plt.subplot(1, len(noise_levels), i + 1)
-        plt.imshow(noised_imgs[i].cpu().numpy())
-        plt.title(f"t = {t}")
-        plt.axis("off")
-    plt.tight_layout()
-    plt.show()
-
+if __name__ == "__main__":
+    model = create_wavelet_diffusion_model(num_emotions=8)
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"Tổng số tham số: {total_params:,}")

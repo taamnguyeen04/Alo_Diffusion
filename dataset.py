@@ -12,7 +12,7 @@ import time
 
 class Affectnet(Dataset):
     def __init__(self, root, is_train, transform=None):
-        image_path = os.path.join(root, "Manually_Annotated_Images")
+        image_path = os.path.join(root, "Manually_Annotated_Images", "Manually_Annotated_Images")
         self.transform = transform
 
         if is_train:
@@ -196,8 +196,8 @@ if __name__ == '__main__':
         ToTensor()
     ])
     #
-    # dataset = Affectnet(root="C:/Users/tam/Documents/data/Affectnet", is_train=True, transform=transform)
-    # print(len(dataset))
+    dataset = Affectnet(root="C:/Users/tam/Documents/data/FEG", is_train=True, transform=transform)
+    print(len(dataset))
     # img, expr, valence, arousal = dataset[0]
     # print("Batch:", img.shape)
     # print("Expressions:", expr)
@@ -239,6 +239,6 @@ if __name__ == '__main__':
     # # So sánh tốc độ
     # measure_load_time(Affectnet, "AffectNet CSV + JPG", csv_root, is_train=True, transform=transform)
     # measure_load_time(AffectnetPt, "AffectNet .pt chunks", pt_root, is_train=True)
-    dataset = AffectnetWavelet(root="C:/Users/tam/Documents/data/Affectnet", is_train=True)
-    print(len(dataset))
-    print(dataset[0])
+    # dataset = AffectnetWavelet(root="C:/Users/tam/Documents/data/Affectnet", is_train=True)
+    # print(len(dataset))
+    # print(dataset[0])
