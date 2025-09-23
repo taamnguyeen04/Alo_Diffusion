@@ -2,21 +2,16 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-import numpy as np
 
 
 class DWT(nn.Module):
-    """Discrete Wavelet Transform"""
+    """Biến đổi wavelet rời rạc, phân tách ảnh thành 4 thành phần tần số"""
     def __init__(self):
         super(DWT, self).__init__()
         self.low = torch.tensor([1., 1.]) / math.sqrt(2)
         self.high = torch.tensor([1., -1.]) / math.sqrt(2)
 
     def forward(self, x):
-        """
-        Input: x (B, C, H, W)
-        Output: (B, 4*C, H/2, W/2) - [LL, LH, HL, HH] concatenated
-        """
         B, C, H, W = x.shape
         assert H % 2 == 0 and W % 2 == 0, "Height and Width must be even"
         low = self.low.to(x.device)
@@ -41,17 +36,13 @@ class DWT(nn.Module):
 
 
 class IWT(nn.Module):
-    """Inverse Wavelet Transform"""
+    """Phép biến đổi ngược của DWT để tái tạo ảnh từ các thành phần tần số"""
     def __init__(self):
         super(IWT, self).__init__()
         self.low = torch.tensor([1., 1.]) / math.sqrt(2)
         self.high = torch.tensor([1., -1.]) / math.sqrt(2)
 
     def forward(self, x):
-        """
-        Input: x (B, 4*C, H, W) - [LL, LH, HL, HH] concatenated
-        Output: (B, C, 2*H, 2*W)
-        """
         B, C4, H, W = x.shape
         assert C4 % 4 == 0, "Channel dimension must be divisible by 4"
         C = C4 // 4
@@ -64,10 +55,10 @@ class IWT(nn.Module):
         low = self.low.to(x.device)
         high = self.high.to(x.device)
 
-        ll = torch.outer(low, low).unsqueeze(0).unsqueeze(0) * 2  # (1, 1, 2, 2)
-        lh = torch.outer(low, high).unsqueeze(0).unsqueeze(0) * 2
-        hl = torch.outer(high, low).unsqueeze(0).unsqueeze(0) * 2
-        hh = torch.outer(high, high).unsqueeze(0).unsqueeze(0) * 2
+        ll = torch.outer(low, low).unsqueeze(0).unsqueeze(0) # (1, 1, 2, 2)
+        lh = torch.outer(low, high).unsqueeze(0).unsqueeze(0)
+        hl = torch.outer(high, low).unsqueeze(0).unsqueeze(0)
+        hh = torch.outer(high, high).unsqueeze(0).unsqueeze(0)
 
         ll = ll.repeat(C, 1, 1, 1)  # (C, 1, 2, 2)
         lh = lh.repeat(C, 1, 1, 1)
@@ -83,7 +74,7 @@ class IWT(nn.Module):
 
 
 class TimeEmbedding(nn.Module):
-    """Positional encoding for timesteps"""
+    """Mã hóa thông tin timestep (số bước trong diffusion)"""
     def __init__(self, dim):
         super().__init__()
         self.dim = dim
@@ -98,15 +89,60 @@ class TimeEmbedding(nn.Module):
         return embeddings
 
 
-class ResBlock(nn.Module):
-    """Residual block with time and emotion conditioning"""
-    def __init__(self, in_channels, out_channels, time_dim, emotion_dim, dropout=0.1):
+class CrossAttention(nn.Module):
+    """Cơ chế cross-attention để trộn đặc trưng ảnh với embedding cảm xúc"""
+    def __init__(self, channels, emotion_dim, num_heads=8):
         super().__init__()
+        self.channels = channels
+        self.num_heads = num_heads
+        self.head_dim = channels // num_heads
+
+        self.norm = nn.GroupNorm(8, channels)
+        self.to_q = nn.Linear(channels, channels)
+        self.to_k = nn.Linear(emotion_dim, channels)
+        self.to_v = nn.Linear(emotion_dim, channels)
+        self.to_out = nn.Linear(channels, channels)
+
+    def forward(self, x, emotion_emb):
+        B, C, H, W = x.shape
+
+        x_norm = self.norm(x)
+        x_flat = x_norm.view(B, C, H*W).transpose(1, 2)  # (B, H*W, C)
+
+        emotion_expanded = emotion_emb.unsqueeze(1).expand(-1, H*W, -1)  # (B, H*W, emotion_dim)
+
+        q = self.to_q(x_flat)  # (B, H*W, C)
+        k = self.to_k(emotion_expanded)  # (B, H*W, C)
+        v = self.to_v(emotion_expanded)  # (B, H*W, C)
+
+        q = q.view(B, H*W, self.num_heads, self.head_dim).transpose(1, 2)  # (B, heads, H*W, head_dim)
+        k = k.view(B, H*W, self.num_heads, self.head_dim).transpose(1, 2)
+        v = v.view(B, H*W, self.num_heads, self.head_dim).transpose(1, 2)
+
+        attn = torch.softmax(torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim), dim=-1)
+
+        out = torch.matmul(attn, v)  # (B, heads, H*W, head_dim)
+        out = out.transpose(1, 2).contiguous().view(B, H*W, C)  # (B, H*W, C)
+        out = self.to_out(out)  # (B, H*W, C)
+
+        out = out.transpose(1, 2).view(B, C, H, W)  # (B, C, H, W)
+        return x + out
+
+
+class ResBlock(nn.Module):
+    """Residual block kết hợp cả timestep và emotion embedding."""
+    def __init__(self, in_channels, out_channels, time_dim, emotion_dim, dropout=0.1, use_cross_attn=False):
+        super().__init__()
+        self.use_cross_attn = use_cross_attn
+
         self.norm1 = nn.GroupNorm(8, in_channels)
         self.conv1 = nn.Conv2d(in_channels, out_channels, 3, padding=1)
 
         self.time_mlp = nn.Linear(time_dim, out_channels)
         self.emotion_mlp = nn.Linear(emotion_dim, out_channels)
+
+        if use_cross_attn:
+            self.cross_attn = CrossAttention(out_channels, emotion_dim)
 
         self.norm2 = nn.GroupNorm(8, out_channels)
         self.conv2 = nn.Conv2d(out_channels, out_channels, 3, padding=1)
@@ -127,6 +163,9 @@ class ResBlock(nn.Module):
         emotion_out = self.emotion_mlp(F.silu(emotion_emb))[:, :, None, None]
         h = h + time_out + emotion_out
 
+        if self.use_cross_attn:
+            h = self.cross_attn(h, emotion_emb)
+
         h = self.norm2(h)
         h = F.silu(h)
         h = self.dropout(h)
@@ -136,7 +175,7 @@ class ResBlock(nn.Module):
 
 
 class FrequencyBottleneckBlock(nn.Module):
-    """Frequency bottleneck block - processes low-freq, passes high-freq"""
+    """Xử lý đặc biệt cho tần số thấp, giữ nguyên tần số cao"""
     def __init__(self, channels, time_dim, emotion_dim):
         super().__init__()
         self.dwt = DWT()
@@ -164,7 +203,7 @@ class FrequencyBottleneckBlock(nn.Module):
 
 
 class FreqAwareDownsample(nn.Module):
-    """Frequency-aware downsampling block"""
+    """Downsampling có nhận biết tần số."""
     def __init__(self, in_channels, out_channels, time_dim, emotion_dim):
         super().__init__()
         self.dwt = DWT()
@@ -191,7 +230,7 @@ class FreqAwareDownsample(nn.Module):
 
 
 class FreqAwareUpsample(nn.Module):
-    """Frequency-aware upsampling block"""
+    """Upsampling có nhận biết tần số"""
     def __init__(self, in_channels, out_channels, time_dim, emotion_dim):
         super().__init__()
         self.iwt = IWT()
@@ -216,19 +255,24 @@ class FreqAwareUpsample(nn.Module):
 
 
 class WaveletResidualConnection(nn.Module):
-    """Frequency residual connection using wavelet downsample"""
-    def __init__(self, in_channels, out_channels):
+    """Kết nối tần số từ ảnh gốc (source image) để giữ đặc trưng nhận dạng."""
+    def __init__(self, in_channels, out_channels, downsample_level=1):
         super().__init__()
         self.dwt = DWT()
-        self.conv = nn.Conv2d(4 * in_channels, out_channels, 1)
+        self.downsample_level = downsample_level
+
+        final_channels = in_channels * (4 ** downsample_level)
+        self.conv = nn.Conv2d(final_channels, out_channels, 1)
 
     def forward(self, x):
-        x_freq = self.dwt(x)  # (B, 4*C, H/2, W/2)
-        return self.conv(x_freq)
+        for _ in range(self.downsample_level):
+            x = self.dwt(x)  # Each DWT: (B, C, H, W) -> (B, 4*C, H/2, W/2)
+
+        return self.conv(x)
 
 
 class WaveletUNet(nn.Module):
-    """Wavelet-embedded U-Net for emotion-conditioned diffusion"""
+    """UNet nhúng wavelet, có điều kiện cảm xúc."""
     def __init__(self,
                  in_channels=12,
                  out_channels=12,
@@ -239,39 +283,35 @@ class WaveletUNet(nn.Module):
         super().__init__()
 
         self.time_embedding = TimeEmbedding(time_dim)
-        self.emotion_embedding = nn.Embedding(num_emotions, emotion_dim)
+        self.num_emotions = num_emotions
+        self.emotion_dim = emotion_dim
+
+        if self.emotion_dim != self.num_emotions:
+            self.emotion_projection = nn.Linear(self.num_emotions, self.emotion_dim)
+        else:
+            self.emotion_projection = None
 
         self.input_conv = nn.Conv2d(in_channels, features[0], 3, padding=1)
 
-        self.aux_expr_head = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Flatten(),
-            nn.Linear(features[-1], 128),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(128, num_emotions)
-        )
-
-        self.aux_va_head = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Flatten(),
-            nn.Linear(features[-1], 128),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(128, 2)  # valence, arousal
-        )
 
         self.encoder_blocks = nn.ModuleList()
         self.downsample_blocks = nn.ModuleList()
+        self.res_blocks = nn.ModuleList()
 
         for i in range(len(features) - 1):
+            use_attn = i >= len(features) // 2
+
             self.encoder_blocks.append(nn.ModuleList([
-                ResBlock(features[i], features[i], time_dim, emotion_dim),
-                ResBlock(features[i], features[i], time_dim, emotion_dim)
+                ResBlock(features[i], features[i], time_dim, emotion_dim, use_cross_attn=use_attn),
+                ResBlock(features[i], features[i], time_dim, emotion_dim, use_cross_attn=use_attn)
             ]))
 
             self.downsample_blocks.append(
                 FreqAwareDownsample(features[i], features[i+1], time_dim, emotion_dim)
+            )
+
+            self.res_blocks.append(
+                WaveletResidualConnection(3, features[i], downsample_level=i+1)
             )
 
         self.bottleneck = nn.ModuleList([
@@ -289,7 +329,7 @@ class WaveletUNet(nn.Module):
             )
 
             self.decoder_blocks.append(nn.ModuleList([
-                ResBlock(features[i-1] * 2, features[i-1], time_dim, emotion_dim),  # *2 for skip connection
+                ResBlock(features[i-1] * 2, features[i-1], time_dim, emotion_dim),
                 ResBlock(features[i-1], features[i-1], time_dim, emotion_dim)
             ]))
 
@@ -309,7 +349,11 @@ class WaveletUNet(nn.Module):
             return_aux: Whether to return auxiliary predictions
         """
         time_emb = self.time_embedding(t)
-        emotion_emb = self.emotion_embedding(emotion_id)
+
+        emotion_emb = F.one_hot(emotion_id, num_classes=self.num_emotions).float()
+
+        if self.emotion_projection is not None:
+            emotion_emb = self.emotion_projection(emotion_emb)
 
         x = self.input_conv(x)
         skip_connections = []
@@ -321,19 +365,20 @@ class WaveletUNet(nn.Module):
             for block in encoder_block:
                 x = block(x, time_emb, emotion_emb)
 
+            if src_image is not None:
+                res_feat = self.res_blocks[i](src_image)
+                x = x + res_feat
+
             skip_connections.append(x)
 
             x, hi_freq = downsample_block(x, time_emb, emotion_emb)
             hi_freq_skips.append(hi_freq)
 
-        bottleneck_features = x
         for block in self.bottleneck:
             if isinstance(block, FrequencyBottleneckBlock):
                 x = block(x, time_emb, emotion_emb)
             else:
                 x = block(x, time_emb, emotion_emb)
-
-        aux_features = x
 
         for i, (upsample_block, decoder_block) in enumerate(
             zip(self.upsample_blocks, self.decoder_blocks)
@@ -348,17 +393,11 @@ class WaveletUNet(nn.Module):
                 x = block(x, time_emb, emotion_emb)
 
         noise_pred = self.output_conv(x)
-
-        if return_aux:
-            expr_pred = self.aux_expr_head(aux_features)
-            va_pred = self.aux_va_head(aux_features)
-            return noise_pred, expr_pred, va_pred
-
         return noise_pred
 
 
 class WaveletDiffusionModel(nn.Module):
-    """Complete Wavelet Diffusion Model for Emotion Editing"""
+    """Mô hình diffusion hoàn chỉnh để chỉnh sửa cảm xúc."""
     def __init__(self,
                  num_emotions=8,
                  num_timesteps=1000,
@@ -385,7 +424,7 @@ class WaveletDiffusionModel(nn.Module):
         self.register_buffer('sqrt_one_minus_alphas_cumprod', torch.sqrt(1.0 - alphas_cumprod))
 
     def forward_process(self, x0, t, noise=None):
-        """Forward diffusion process - add noise"""
+        """thêm nhiễu vào wavelet ở bước t."""
         if noise is None:
             noise = torch.randn_like(x0)
 
@@ -395,7 +434,7 @@ class WaveletDiffusionModel(nn.Module):
         return sqrt_alphas_cumprod_t * x0 + sqrt_one_minus_alphas_cumprod_t * noise, noise
 
     def forward(self, x, emotion_id, src_image=None):
-        """Training forward pass"""
+        """training → dự đoán nhiễu và tính loss."""
         x_wavelet = self.dwt(x)  # (B, 12, H/2, W/2)
         t = torch.randint(0, self.num_timesteps, (x.shape[0],), device=x.device)
         x_noisy, noise = self.forward_process(x_wavelet, t)
@@ -404,8 +443,8 @@ class WaveletDiffusionModel(nn.Module):
         return loss
 
     @torch.no_grad()
-    def sample(self, src_image, target_emotion_id, num_steps=50):
-        """DDIM sampling for inference - Fixed implementation"""
+    def sample(self, src_image, target_emotion_id, num_steps=100):
+        """inference → dùng DDIM sampling để sinh ảnh mới theo cảm xúc mục tiêu."""
         device = src_image.device
         B = src_image.shape[0]
         src_wavelet = self.dwt(src_image)
@@ -437,6 +476,6 @@ def create_wavelet_diffusion_model(num_emotions=7):
 
 
 if __name__ == "__main__":
-    model = create_wavelet_diffusion_model(num_emotions=8)
+    model = create_wavelet_diffusion_model(num_emotions=7)
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Tổng số tham số: {total_params:,}")

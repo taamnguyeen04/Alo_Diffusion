@@ -21,7 +21,7 @@ class Affectnet(Dataset):
             label_path = os.path.join(root, "validation.csv")
 
         list_label = pd.read_csv(label_path)
-        valid_labels = list_label[list_label['expression'] < 8].copy()
+        valid_labels = list_label[list_label['expression'] < 7].copy()
 
         valid_labels['full_image_path'] = valid_labels['subDirectory_filePath'].apply(
             lambda x: os.path.join(image_path, x))
@@ -198,7 +198,7 @@ if __name__ == '__main__':
     #
     dataset = Affectnet(root="C:/Users/tam/Documents/data/FEG", is_train=True, transform=transform)
     print(len(dataset))
-    # img, expr, valence, arousal = dataset[0]
+    # img, expr, valence, arousal = dataset[0] 283901
     # print("Batch:", img.shape)
     # print("Expressions:", expr)
     # print("Valence:", valence)

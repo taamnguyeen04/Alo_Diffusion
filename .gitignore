@@ -3,3 +3,5 @@
 /SD/*
 /VAE/*
 /chunks1024/*
+/WaveletDiffusion
+affecnet7_epoch6_acc0.6569.pth

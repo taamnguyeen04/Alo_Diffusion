@@ -1,8 +1,4 @@
-import os
 import shutil
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
 from torchvision.utils import save_image
 from torchvision.transforms import Resize, ToTensor, Compose, Normalize
 from torch.utils.data import Dataset, DataLoader
@@ -11,50 +7,14 @@ from model import WaveletDiffusionModel, DWT, IWT
 from dataset import Affectnet
 from tqdm import tqdm
 import lpips
-from torchvision.models import resnet50
+from criterions import *
+# pip install insightface
 
 
-class ArcFaceIdentityLoss(nn.Module):
-    """ArcFace-based identity preservation loss"""
-    def __init__(self, device):
-        super().__init__()
-        self.device = device
-        # In practice, you would load pre-trained ArcFace model
-        # For simplicity, using cosine similarity on features
-        self.feature_extractor = resnet50(pretrained=True)
-        self.feature_extractor.fc = nn.Identity()
-        self.feature_extractor.eval()
-
-        for param in self.feature_extractor.parameters():
-            param.requires_grad = False
-
-    def forward(self, img1, img2):
-        """
-        Compute identity loss between two images
-        Args:
-            img1, img2: (B, 3, H, W) images in range [-1, 1]
-        """
-        # Normalize to [0, 1] for feature extraction
-        img1_norm = (img1 + 1) / 2
-        img2_norm = (img2 + 1) / 2
-
-        # Extract features
-        feat1 = self.feature_extractor(img1_norm)
-        feat2 = self.feature_extractor(img2_norm)
-
-        # Normalize features
-        feat1 = F.normalize(feat1, p=2, dim=1)
-        feat2 = F.normalize(feat2, p=2, dim=1)
-
-        # Cosine similarity
-        cosine_sim = F.cosine_similarity(feat1, feat2, dim=1)
-
-        # Identity loss = 1 - cosine_similarity
-        return 1 - cosine_sim.mean()
 
 
 def save_checkpoint(filepath, epoch, step, model, optimizer, loss):
-    print(f"💾 Đang lưu checkpoint: epoch {epoch}, step {step}, loss {loss.item():.4f}")
+    print(f"Đang lưu checkpoint: epoch {epoch}, step {step}, loss {loss.item():.4f}")
 
     checkpoint = {
         'epoch': epoch,
@@ -73,15 +33,15 @@ def save_checkpoint(filepath, epoch, step, model, optimizer, loss):
 
     if not os.path.exists(best_path):
         torch.save(checkpoint, best_path)
-        print("🏆 Đã lưu best_model.pt (lần đầu)")
+        print("Đã lưu best_model.pt (lần đầu)")
     else:
         try:
             best_loss = torch.load(best_path, map_location='cpu')['loss']
             if loss.item() < best_loss:
                 torch.save(checkpoint, best_path)
-                print(f"🏆 Đã cập nhật best_model.pt: {best_loss:.4f} → {loss.item():.4f}")
+                print(f"Đã cập nhật best_model.pt: {best_loss:.4f} → {loss.item():.4f}")
         except Exception as e:
-            print(f"⚠️ Lỗi khi đọc best_model.pt: {e} → lưu đè")
+            print(f"Lỗi khi đọc best_model.pt: {e} → lưu đè")
             torch.save(checkpoint, best_path)
 
 
@@ -99,9 +59,9 @@ def load_checkpoint(filepath, model, optimizer, best_loss, device):
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             start_epoch = checkpoint['epoch']
             loaded = True
-            print(f"✅ Loaded từ last_model.pt epoch {start_epoch}")
+            print(f"Loaded từ last_model.pt epoch {start_epoch}")
         except Exception as e:
-            print(f"⚠️ Lỗi khi load last_model.pt: {e}")
+            print(f"Lỗi khi load last_model.pt: {e}")
 
     if not loaded and os.path.isfile(best_path):
         try:
@@ -109,13 +69,13 @@ def load_checkpoint(filepath, model, optimizer, best_loss, device):
             model.load_state_dict(checkpoint['model_state_dict'])
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             start_epoch = checkpoint['epoch']
-            print(f"✅ Loaded từ best_model.pt epoch {start_epoch}")
+            print(f"Loaded từ best_model.pt epoch {start_epoch}")
             loaded = True
         except Exception as e:
-            print(f"⚠️ Lỗi khi load best_model.pt: {e}")
+            print(f"Lỗi khi load best_model.pt: {e}")
 
     if not loaded:
-        print("🚀 Không tìm thấy hoặc không load được checkpoint, bắt đầu từ đầu.")
+        print("Không tìm thấy hoặc không load được checkpoint, bắt đầu từ đầu.")
         start_epoch = 0
 
     if os.path.isfile(best_path):
@@ -138,23 +98,20 @@ def train():
     # Device setup
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Hyperparameters
-    batch_size = 8
+    batch_size = 4
     lr = 1e-4
     num_epochs = 100
     image_size = 224
-    labels = ["Neutral", "Happy", "Sad", "Surprise", "Fear", "Disgust", "Anger", "Contempt"]
+    labels = ["Neutral", "Happy", "Sad", "Surprise", "Fear", "Disgust", "Anger"]
 
-    print(f"📦 Batch size: {batch_size}")
+    print(f"Batch size: {batch_size}")
     print(f"Device: {device}")
 
-    # Loss weights
     lambda_ddpm = 1.0
     lambda_wav_ll = 0.1
     lambda_wav_hi = 0.2
-    lambda_aux_expr = 0.02
-    lambda_aux_va = 0.01
-    lambda_id = 0.5
+    lambda_dan_expr = 0.5
+    lambda_id = 0.3
     lambda_lpips = 0.05
 
     # Directories
@@ -163,6 +120,10 @@ def train():
     out_path = "WaveletDiffusion/out"
 
     for dir_path in [log_dir, model_path, out_path]:
+        if dir_path == model_path:
+            os.makedirs(dir_path, exist_ok=True)
+            continue
+
         if os.path.exists(dir_path):
             shutil.rmtree(dir_path)
         os.makedirs(dir_path, exist_ok=True)
@@ -174,11 +135,11 @@ def train():
     transform = Compose([
         Resize((image_size, image_size)),
         ToTensor(),
-        Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])  # [-1, 1]
+        Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
     ])
 
     # Datasets
-    print("📚 Loading datasets...")
+    print("Loading datasets...")
     train_dataset = Affectnet(root="C:/Users/tam/Documents/data/FEG", is_train=True, transform=transform)
     val_dataset = Affectnet(root="C:/Users/tam/Documents/data/FEG", is_train=False, transform=transform)
 
@@ -197,24 +158,40 @@ def train():
         shuffle=False,
         drop_last=True
     )
-
     print(f"Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}")
 
     # Models
-    print("🏗️ Building models...")
+    print("Building models...")
 
-    # Main wavelet diffusion model
     model = WaveletDiffusionModel(num_emotions=len(labels)).to(device)
+    emotion_model = Emotion_model()
 
-    # Auxiliary models
-    identity_loss_fn = ArcFaceIdentityLoss(device).to(device)
-    lpips_loss_fn = lpips.LPIPS(net='vgg').to(device)
+    import torchvision.models as models
+    resnet50 = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1).to(device)
+    resnet50.eval()
+    for param in resnet50.parameters():
+        param.requires_grad = False
+    try:
+        lpips_loss_fn = lpips.LPIPS(net='vgg', pretrained=True).to(device)
+    except:
+        lpips_loss_fn = lpips.LPIPS(net='vgg').to(device)
     for param in lpips_loss_fn.parameters():
         param.requires_grad = False
 
-    # DWT/IWT transforms
+    initial_weights = {
+        'lambda_id': lambda_id,
+        'lambda_dan_expr': lambda_dan_expr
+    }
+    loss_weighter = AdaptiveLossWeighter(initial_weights, warmup_steps=5000)
+
     dwt = DWT().to(device)
     iwt = IWT().to(device)
+    with torch.no_grad():
+        x = next(iter(val_dataloader))[0].to(device)[:4]
+        x_wave = dwt(x)
+        x_rec = iwt(x_wave)
+        mse = ((x - x_rec) ** 2).mean().item()
+        print("DWT/IWT roundtrip MSE:", mse)
 
     # Optimizer
     optimizer = torch.optim.AdamW(
@@ -225,7 +202,7 @@ def train():
     )
 
     # Load checkpoint
-    print("📁 Loading checkpoint...")
+    print("Loading checkpoint...")
     start_epoch, best_loss = load_checkpoint(model_path, model, optimizer, best_loss, device)
 
     # Fixed validation samples
@@ -234,87 +211,112 @@ def train():
     expr_fixed = expr_fixed.to(device)
 
     try:
-        print("🚀 Starting training...")
+        print("Starting training...")
         for epoch in range(start_epoch, num_epochs):
             model.train()
 
             epoch_bar = tqdm(enumerate(train_dataloader), total=len(train_dataloader),
                            desc=f"Epoch {epoch}/{num_epochs}")
 
-            for i, (img_real, expr_org, valence_org, arousal_org) in epoch_bar:
+            for i, (img_real, expr_org, _, _) in epoch_bar:  # Bỏ valence, arousal
                 img_real = img_real.to(device)
                 expr_org = expr_org.to(device)
-                valence_org = valence_org.to(device)
-                arousal_org = arousal_org.to(device)
 
-                # Create target emotion (random shuffle for data augmentation)
                 rand_idx = torch.randperm(expr_org.size(0))
                 expr_trg = expr_org[rand_idx]
-                valence_trg = valence_org[rand_idx]
-                arousal_trg = arousal_org[rand_idx]
 
                 # ===== FORWARD PASS =====
 
-                # 1. DDPM Loss (main loss) - with auxiliary predictions
                 x_wavelet = dwt(img_real)
-
                 t = torch.randint(0, model.num_timesteps, (img_real.shape[0],), device=device)
                 x_noisy, noise = model.forward_process(x_wavelet, t)
-
-                # Get main prediction and auxiliary predictions
-                noise_pred, expr_pred, va_pred = model.unet(
-                    x_noisy, t, expr_trg, img_real, return_aux=True
-                )
-
-                # Main DDPM loss
+                noise_pred = model.unet(x_noisy, t, expr_trg, img_real)
                 ddpm_loss = F.l1_loss(noise_pred, noise)
+                dan_expr_loss = torch.tensor(0.0, device=device)
 
-                # 2. Auxiliary losses from built-in heads
-                aux_expr_loss = F.cross_entropy(expr_pred, expr_trg)
-                aux_va_loss = F.mse_loss(va_pred, torch.stack([valence_trg, arousal_trg], dim=1))
+                current_losses = {
+                    'dan_expr': dan_expr_loss,
+                    'ddpm': ddpm_loss
+                }
+                weight_updates = loss_weighter.update_weights(current_losses)
+                current_lambda_id = weight_updates.get('lambda_id', lambda_id)
+                current_lambda_dan_expr = weight_updates.get('lambda_dan_expr', lambda_dan_expr)
 
-                # 3. Generate samples for additional losses (less frequent to save computation)
-                if i % 10 == 0:  # Only every 10 iterations
+                if i % 20 == 0:
                     with torch.no_grad():
-                        generated_img = model.sample(img_real, expr_trg, num_steps=50)
+                        generated_img = model.sample(img_real, expr_trg, num_steps=75)
 
-                    # 4. Wavelet Reconstruction Consistency Loss
                     img_wavelet_full = dwt(img_real)
                     gen_wavelet = dwt(generated_img)
 
-                    # Split into subbands
-                    C = img_real.shape[1]  # 3 for RGB
-                    img_ll = img_wavelet_full[:, :C, :, :]      # Low-freq
-                    img_hi = img_wavelet_full[:, C:, :, :]      # High-freq (LH, HL, HH)
+                    C = img_real.shape[1]
+                    img_ll = img_wavelet_full[:, :C, :, :]
+                    img_hi = img_wavelet_full[:, C:, :, :]
                     gen_ll = gen_wavelet[:, :C, :, :]
                     gen_hi = gen_wavelet[:, C:, :, :]
 
                     wav_loss_ll = F.l1_loss(gen_ll, img_ll)
                     wav_loss_hi = F.l1_loss(gen_hi, img_hi)
-                    wav_loss = lambda_wav_ll * wav_loss_ll + lambda_wav_hi * wav_loss_hi
 
-                    # 5. Identity Preservation Loss
-                    id_loss = identity_loss_fn(img_real, generated_img)
+                    with torch.no_grad():
+                        same_emotion_img = model.sample(img_real, expr_org, num_steps=75)
+                        same_emotion_wavelet = dwt(same_emotion_img)
+                        same_ll = same_emotion_wavelet[:, :C, :, :]
+                        same_hi = same_emotion_wavelet[:, C:, :, :]
 
-                    # 6. Perceptual Loss (LPIPS)
+                    emotion_wav_hi_loss = F.l1_loss(gen_hi, same_hi) * 0.5
+                    emotion_wav_ll_loss = F.l1_loss(gen_ll, same_ll) * 0.1
+
+                    wav_loss = (lambda_wav_ll * wav_loss_ll +
+                               lambda_wav_hi * wav_loss_hi +
+                               emotion_wav_hi_loss +
+                               emotion_wav_ll_loss)
+
+                    real_norm = (img_real + 1) / 2  # [-1,1] -> [0,1]
+                    gen_norm = (generated_img + 1) / 2
+
+                    real_resized = F.interpolate(real_norm, size=(224, 224), mode='bilinear')
+                    gen_resized = F.interpolate(gen_norm, size=(224, 224), mode='bilinear')
+
+                    # ImageNet normalization
+                    mean_resnet = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(device)
+                    std_resnet = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(device)
+                    real_resized = (real_resized - mean_resnet) / std_resnet
+                    gen_resized = (gen_resized - mean_resnet) / std_resnet
+
+                    with torch.no_grad():
+                        real_features = resnet50(real_resized)
+                        gen_features = resnet50(gen_resized)
+
+                    id_loss = 1 - F.cosine_similarity(real_features, gen_features).mean()
+
                     lpips_loss = lpips_loss_fn(img_real, generated_img).mean()
 
-                    # ===== TOTAL LOSS =====
+                    generated_img_norm = (generated_img + 1) / 2  # [-1,1] -> [0,1]
+                    dan_prediction_list = []
+                    for j in range(generated_img_norm.shape[0]):
+                        single_img = generated_img_norm[j:j+1]  # (1, 3, H, W)
+                        dan_input = F.interpolate(single_img, size=(224, 224), mode='bilinear')
+                        mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(dan_input.device)
+                        std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(dan_input.device)
+                        dan_input = (dan_input - mean) / std
+                        with torch.no_grad():
+                            dan_out, _, _ = emotion_model.model(dan_input)
+                            dan_prediction_list.append(dan_out)
+
+                    dan_predictions = torch.cat(dan_prediction_list, dim=0)
+                    dan_expr_loss = F.cross_entropy(dan_predictions, expr_trg)
+
+                    # ===== TOTAL LOSS (with adaptive weights) =====
                     total_loss = (
                         lambda_ddpm * ddpm_loss +
-                        lambda_aux_expr * aux_expr_loss +
-                        lambda_aux_va * aux_va_loss +
+                        current_lambda_dan_expr * dan_expr_loss +
                         wav_loss +
-                        lambda_id * id_loss +
+                        current_lambda_id * id_loss +
                         lambda_lpips * lpips_loss
                     )
                 else:
-                    # Only use main losses when not generating samples
-                    total_loss = (
-                        lambda_ddpm * ddpm_loss +
-                        lambda_aux_expr * aux_expr_loss +
-                        lambda_aux_va * aux_va_loss
-                    )
+                    total_loss = lambda_ddpm * ddpm_loss
                     wav_loss = torch.tensor(0.0, device=device)
                     id_loss = torch.tensor(0.0, device=device)
                     lpips_loss = torch.tensor(0.0, device=device)
@@ -329,8 +331,7 @@ def train():
                 epoch_bar.set_postfix({
                     "Total": f"{total_loss.item():.4f}",
                     "DDPM": f"{ddpm_loss.item():.4f}",
-                    "Aux_Expr": f"{aux_expr_loss.item():.4f}",
-                    "Aux_VA": f"{aux_va_loss.item():.4f}",
+                    "DAN_Expr": f"{dan_expr_loss.item():.4f}",
                     "Wav": f"{wav_loss.item():.4f}",
                     "ID": f"{id_loss.item():.4f}"
                 })
@@ -340,30 +341,25 @@ def train():
                     step = epoch * len(train_dataloader) + i
                     writer.add_scalar("Loss/Total", total_loss.item(), step)
                     writer.add_scalar("Loss/DDPM", ddpm_loss.item(), step)
-                    writer.add_scalar("Loss/Aux_Expression", aux_expr_loss.item(), step)
-                    writer.add_scalar("Loss/Aux_VA", aux_va_loss.item(), step)
+                    writer.add_scalar("Loss/DAN_Expression", dan_expr_loss.item(), step)
                     writer.add_scalar("Loss/Wavelet", wav_loss.item(), step)
                     writer.add_scalar("Loss/Identity", id_loss.item(), step)
                     writer.add_scalar("Loss/LPIPS", lpips_loss.item(), step)
 
-                # Save checkpoint
                 if i % 100 == 0:
                     save_checkpoint(model_path, epoch, i, model, optimizer, total_loss)
 
-                # Generate validation images
                 if i % 200 == 0:
-                    print("🖼️ Generating validation images...")
+                    print("Generating validation images...")
                     model.eval()
                     with torch.no_grad():
-                        # Generate different emotions for fixed images
                         all_imgs = [x_fixed[:4]]  # Original images
 
                         for emotion_id in range(len(labels)):
                             emotion_tensor = torch.full((4,), emotion_id, device=device)
-                            generated = model.sample(x_fixed[:4], emotion_tensor, num_steps=50)
+                            generated = model.sample(x_fixed[:4], emotion_tensor, num_steps=75)
                             all_imgs.append(generated)
 
-                        # Combine all images
                         all_imgs = torch.cat(all_imgs, dim=0)
                         all_imgs = (all_imgs.clamp(-1, 1) + 1) / 2  # [-1,1] -> [0,1]
 
@@ -373,16 +369,16 @@ def train():
                             nrow=4,
                             normalize=False
                         )
-                        print(f"✅ Saved validation images: {out_path}/epoch{epoch}_iter{i}_emotions.png")
+                        print(f"Saved validation images: {out_path}/epoch{epoch}_iter{i}_emotions.png")
 
                     model.train()
 
     except KeyboardInterrupt:
-        print("⚠️ Training interrupted by user")
+        print("Training interrupted by user")
         if 'total_loss' in locals():
             save_checkpoint(model_path, epoch, i, model, optimizer, total_loss)
 
-    print("✅ Training completed!")
+    print("Training completed!")
     writer.close()
 
 
