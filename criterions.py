@@ -9,6 +9,8 @@ import torch
 import torch.nn.init as init
 from torchvision import models
 from torchvision.models import resnet50
+from dataset import Affectnet
+from torch.utils.data import Dataset, DataLoader
 
 class AdaptiveLossWeighter(nn.Module):
     """Adaptive loss weighting to balance identity preservation vs emotion expression"""
@@ -217,9 +219,23 @@ class Emotion_model():
 
 if __name__ == "__main__":
     model = Emotion_model()
+    batch_size = 4
+    transform = Compose([
+        Resize((image_size, image_size)),
+        ToTensor(),
+        Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+    ])
     image = r"C:\Users\tam\Documents\data\FEG\Manually_Annotated_Images\Manually_Annotated_Images\12\4e73e4cfde7ded87a2d6274a5aa52aef4fac3a81c67f5fa169cf0c3e.jpeg"
     assert os.path.exists(image), "Failed to load image file."
     label = model.fer(image)
+    val_dataset = Affectnet(root="C:/Users/tam/Documents/data/FEG", is_train=False, transform=transform)
+    val_dataloader = DataLoader(
+        dataset=val_dataset,
+        batch_size=batch_size,
+        num_workers=4,
+        shuffle=False,
+        drop_last=True
+    )
     print(f'emotion label: {label}')
 
 

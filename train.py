@@ -8,10 +8,8 @@ from dataset import Affectnet
 from tqdm import tqdm
 import lpips
 from criterions import *
+from icecream import ic
 # pip install insightface
-
-
-
 
 def save_checkpoint(filepath, epoch, step, model, optimizer, loss):
     print(f"Đang lưu checkpoint: epoch {epoch}, step {step}, loss {loss.item():.4f}")
@@ -110,14 +108,14 @@ def train():
     lambda_ddpm = 1.0
     lambda_wav_ll = 0.1
     lambda_wav_hi = 0.2
-    lambda_dan_expr = 0.5
-    lambda_id = 0.3
+    lambda_dan_expr = 2.0  # Tăng mạnh để ép model học cảm xúc
+    lambda_id = 0.1  # Giảm để cho phép thay đổi nhiều hơn
     lambda_lpips = 0.05
 
     # Directories
-    log_dir = "WaveletDiffusion/runs/exp"
-    model_path = "WaveletDiffusion/model"
-    out_path = "WaveletDiffusion/out"
+    log_dir = "WaveletDiffusion5/runs/exp"
+    model_path = "WaveletDiffusion5/model"
+    out_path = "WaveletDiffusion5/out"
 
     for dir_path in [log_dir, model_path, out_path]:
         if dir_path == model_path:
@@ -232,7 +230,26 @@ def train():
                 x_noisy, noise = model.forward_process(x_wavelet, t)
                 noise_pred = model.unet(x_noisy, t, expr_trg, img_real)
                 ddpm_loss = F.l1_loss(noise_pred, noise)
-                dan_expr_loss = torch.tensor(0.0, device=device)
+
+                # Generate images to calculate dan_expr_loss every batch
+                with torch.no_grad():
+                    generated_img = model.sample(img_real, expr_trg, num_steps=75, denoising_strength=1)
+
+                # Calculate dan_expr_loss for every batch
+                generated_img_norm = (generated_img + 1) / 2  # [-1,1] -> [0,1]
+                dan_prediction_list = []
+                for j in range(generated_img_norm.shape[0]):
+                    single_img = generated_img_norm[j:j+1]  # (1, 3, H, W)
+                    dan_input = F.interpolate(single_img, size=(224, 224), mode='bilinear')
+                    mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(dan_input.device)
+                    std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(dan_input.device)
+                    dan_input = (dan_input - mean) / std
+                    with torch.no_grad():
+                        dan_out, _, _ = emotion_model.model(dan_input)
+                        dan_prediction_list.append(dan_out)
+
+                dan_predictions = torch.cat(dan_prediction_list, dim=0)
+                dan_expr_loss = F.cross_entropy(dan_predictions, expr_trg)
 
                 current_losses = {
                     'dan_expr': dan_expr_loss,
@@ -243,8 +260,10 @@ def train():
                 current_lambda_dan_expr = weight_updates.get('lambda_dan_expr', lambda_dan_expr)
 
                 if i % 20 == 0:
+                    # ic(dan_predictions, expr_trg, expr_org)
                     with torch.no_grad():
-                        generated_img = model.sample(img_real, expr_trg, num_steps=75)
+                        # Sử dụng denoising strength rất cao để ép model học thay đổi cảm xúc mạnh
+                        generated_img = model.sample(img_real, expr_trg, num_steps=75, denoising_strength=0.1)
 
                     img_wavelet_full = dwt(img_real)
                     gen_wavelet = dwt(generated_img)
@@ -292,21 +311,6 @@ def train():
 
                     lpips_loss = lpips_loss_fn(img_real, generated_img).mean()
 
-                    generated_img_norm = (generated_img + 1) / 2  # [-1,1] -> [0,1]
-                    dan_prediction_list = []
-                    for j in range(generated_img_norm.shape[0]):
-                        single_img = generated_img_norm[j:j+1]  # (1, 3, H, W)
-                        dan_input = F.interpolate(single_img, size=(224, 224), mode='bilinear')
-                        mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(dan_input.device)
-                        std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(dan_input.device)
-                        dan_input = (dan_input - mean) / std
-                        with torch.no_grad():
-                            dan_out, _, _ = emotion_model.model(dan_input)
-                            dan_prediction_list.append(dan_out)
-
-                    dan_predictions = torch.cat(dan_prediction_list, dim=0)
-                    dan_expr_loss = F.cross_entropy(dan_predictions, expr_trg)
-
                     # ===== TOTAL LOSS (with adaptive weights) =====
                     total_loss = (
                         lambda_ddpm * ddpm_loss +
@@ -316,7 +320,10 @@ def train():
                         lambda_lpips * lpips_loss
                     )
                 else:
-                    total_loss = lambda_ddpm * ddpm_loss
+                    total_loss = (
+                        lambda_ddpm * ddpm_loss +
+                        current_lambda_dan_expr * dan_expr_loss
+                    )
                     wav_loss = torch.tensor(0.0, device=device)
                     id_loss = torch.tensor(0.0, device=device)
                     lpips_loss = torch.tensor(0.0, device=device)
@@ -357,7 +364,8 @@ def train():
 
                         for emotion_id in range(len(labels)):
                             emotion_tensor = torch.full((4,), emotion_id, device=device)
-                            generated = model.sample(x_fixed[:4], emotion_tensor, num_steps=75)
+                            # Sử dụng denoising strength cao để tạo sự khác biệt cảm xúc rõ ràng
+                            generated = model.sample(x_fixed[:4], emotion_tensor, num_steps=75, denoising_strength=0.1)
                             all_imgs.append(generated)
 
                         all_imgs = torch.cat(all_imgs, dim=0)

@@ -5,12 +5,8 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="93e00903-d4bb-4234-ab41-d97e6c0c79c1" name="Changes" comment="stable diffusion model">
-      <change afterPath="$PROJECT_DIR$/criterions.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/model.md" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/WaveletDiffusion/out/epoch0_iter0_emotions.png" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/WaveletDiffusion/runs/exp/events.out.tfevents.1758261309.DESKTOP-5TELQ79.6496.0" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/dataset.py" beforeDir="false" afterPath="$PROJECT_DIR$/dataset.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/criterions.py" beforeDir="false" afterPath="$PROJECT_DIR$/criterions.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/model.py" beforeDir="false" afterPath="$PROJECT_DIR$/model.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/train.py" beforeDir="false" afterPath="$PROJECT_DIR$/train.py" afterDir="false" />
     </list>
@@ -57,7 +53,9 @@
     "Python.main.executor": "Run",
     "Python.model.executor": "Run",
     "Python.test.executor": "Run",
+    "Python.test_denoising_strength.executor": "Run",
     "Python.test_emotion_condition.executor": "Run",
+    "Python.test_gradient_flow.executor": "Run",
     "Python.train.executor": "Run",
     "Python.train_VAE.executor": "Run",
     "Python.train_wavelet.executor": "Run",

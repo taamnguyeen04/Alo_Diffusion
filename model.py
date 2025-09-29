@@ -121,6 +121,9 @@ class CrossAttention(nn.Module):
 
         attn = torch.softmax(torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim), dim=-1)
 
+        # Debug attention maps
+        # print(f"Attention mean: {attn.abs().mean().item():.6f}")
+
         out = torch.matmul(attn, v)  # (B, heads, H*W, head_dim)
         out = out.transpose(1, 2).contiguous().view(B, H*W, C)  # (B, H*W, C)
         out = self.to_out(out)  # (B, H*W, C)
@@ -140,6 +143,10 @@ class ResBlock(nn.Module):
 
         self.time_mlp = nn.Linear(time_dim, out_channels)
         self.emotion_mlp = nn.Linear(emotion_dim, out_channels)
+
+        # FiLM layers for emotion conditioning
+        self.film_gamma = nn.Linear(emotion_dim, out_channels)
+        self.film_beta = nn.Linear(emotion_dim, out_channels)
 
         if use_cross_attn:
             self.cross_attn = CrossAttention(out_channels, emotion_dim)
@@ -162,6 +169,11 @@ class ResBlock(nn.Module):
         time_out = self.time_mlp(F.silu(time_emb))[:, :, None, None]
         emotion_out = self.emotion_mlp(F.silu(emotion_emb))[:, :, None, None]
         h = h + time_out + emotion_out
+
+        # Apply FiLM conditioning: h' = gamma * h + beta
+        gamma = self.film_gamma(F.silu(emotion_emb))[:, :, None, None]
+        beta = self.film_beta(F.silu(emotion_emb))[:, :, None, None]
+        h = gamma * h + beta
 
         if self.use_cross_attn:
             h = self.cross_attn(h, emotion_emb)
@@ -286,10 +298,8 @@ class WaveletUNet(nn.Module):
         self.num_emotions = num_emotions
         self.emotion_dim = emotion_dim
 
-        if self.emotion_dim != self.num_emotions:
-            self.emotion_projection = nn.Linear(self.num_emotions, self.emotion_dim)
-        else:
-            self.emotion_projection = None
+        # Use learnable embedding instead of one-hot + projection
+        self.emotion_embedding = nn.Embedding(num_emotions, emotion_dim)
 
         self.input_conv = nn.Conv2d(in_channels, features[0], 3, padding=1)
 
@@ -350,10 +360,8 @@ class WaveletUNet(nn.Module):
         """
         time_emb = self.time_embedding(t)
 
-        emotion_emb = F.one_hot(emotion_id, num_classes=self.num_emotions).float()
-
-        if self.emotion_projection is not None:
-            emotion_emb = self.emotion_projection(emotion_emb)
+        # Use embedding lookup instead of one-hot encoding
+        emotion_emb = self.emotion_embedding(emotion_id)
 
         x = self.input_conv(x)
         skip_connections = []
@@ -367,7 +375,7 @@ class WaveletUNet(nn.Module):
 
             if src_image is not None:
                 res_feat = self.res_blocks[i](src_image)
-                x = x + res_feat
+                x = x + 0.05 * res_feat
 
             skip_connections.append(x)
 
@@ -413,6 +421,14 @@ class WaveletDiffusionModel(nn.Module):
 
         self.unet = WaveletUNet(num_emotions=num_emotions)
 
+        # Register gradient hook on first conv layer
+        def grad_hook(module, grad_in, grad_out):
+            if grad_out[0] is not None:
+                # print(f"UNet first conv grad mean: {grad_out[0].abs().mean().item():.6f}")
+                pass
+
+        self.unet.input_conv.register_full_backward_hook(grad_hook)
+
         betas = torch.linspace(beta_start, beta_end, num_timesteps)
         alphas = 1.0 - betas
         alphas_cumprod = torch.cumprod(alphas, dim=0)
@@ -443,13 +459,41 @@ class WaveletDiffusionModel(nn.Module):
         return loss
 
     @torch.no_grad()
-    def sample(self, src_image, target_emotion_id, num_steps=100):
-        """inference → dùng DDIM sampling để sinh ảnh mới theo cảm xúc mục tiêu."""
+    def sample(self, src_image, target_emotion_id, num_steps=100, denoising_strength=1.0):
+        """
+        inference → dùng DDIM sampling để sinh ảnh mới theo cảm xúc mục tiêu.
+
+        Args:
+            src_image: Ảnh gốc (B, 3, H, W)
+            target_emotion_id: ID cảm xúc mục tiêu (B,)
+            num_steps: Số bước sampling
+            denoising_strength: Mức độ denoising (0.0-1.0).
+                              1.0 = thay đổi hoàn toàn, 0.0 = không thay đổi
+        """
         device = src_image.device
         B = src_image.shape[0]
         src_wavelet = self.dwt(src_image)
-        x = torch.randn_like(src_wavelet)
-        timesteps = torch.linspace(self.num_timesteps - 1, 0, num_steps, dtype=torch.long, device=device)
+
+        # Tính toán start timestep dựa trên denoising_strength
+        # Với strength cao hơn = nhiễu nhiều hơn = thay đổi nhiều hơn
+        start_timestep = int((1.0 - denoising_strength) * self.num_timesteps)
+        start_timestep = max(1, start_timestep)  # Ít nhất là 1
+
+        # Tạo timesteps từ start_timestep về 0
+        timesteps = torch.linspace(start_timestep - 1, 0,
+                                 min(num_steps, start_timestep),
+                                 dtype=torch.long, device=device)
+
+        # Luôn bắt đầu từ ảnh gốc có nhiễu
+        if start_timestep > 0:
+            # Thêm nhiễu vào ảnh gốc
+            noise = torch.randn_like(src_wavelet)
+            alpha_start = self.sqrt_alphas_cumprod[start_timestep]
+            sigma_start = self.sqrt_one_minus_alphas_cumprod[start_timestep]
+            x = alpha_start * src_wavelet + sigma_start * noise
+        else:
+            # Trường hợp đặc biệt: không thêm nhiễu (strength = 0)
+            x = src_wavelet
 
         for i, t in enumerate(timesteps):
             t_tensor = torch.full((B,), t.item(), device=device, dtype=torch.long)
