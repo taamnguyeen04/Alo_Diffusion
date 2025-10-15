@@ -70,7 +70,13 @@ class IWT(nn.Module):
         x_hl_up = F.conv_transpose2d(x_hl, hl, stride=2, groups=C)
         x_hh_up = F.conv_transpose2d(x_hh, hh, stride=2, groups=C)
 
-        return x_ll_up + x_lh_up + x_hl_up + x_hh_up
+        reconstructed = x_ll_up + x_lh_up + x_hl_up + x_hh_up
+        # scale = reconstructed.abs().mean(dim=[1, 2, 3], keepdim=True).clamp(min=1e-6)
+        # return reconstructed / scale.mean().detach() * 0.5
+        # reconstructed = x_ll_up + x_lh_up + x_hl_up + x_hh_up
+        #
+        # # Stable reconstruction without aggressive scaling
+        return torch.clamp(reconstructed, -1, 1)
 
 
 class TimeEmbedding(nn.Module):
@@ -171,6 +177,7 @@ class ResBlock(nn.Module):
         h = h + time_out + emotion_out
 
         # Apply FiLM conditioning: h' = gamma * h + beta
+        emotion_emb = F.layer_norm(emotion_emb, (emotion_emb.shape[-1],))
         gamma = self.film_gamma(F.silu(emotion_emb))[:, :, None, None]
         beta = self.film_beta(F.silu(emotion_emb))[:, :, None, None]
         h = gamma * h + beta
@@ -279,7 +286,6 @@ class WaveletResidualConnection(nn.Module):
     def forward(self, x):
         for _ in range(self.downsample_level):
             x = self.dwt(x)  # Each DWT: (B, C, H, W) -> (B, 4*C, H/2, W/2)
-
         return self.conv(x)
 
 
@@ -303,14 +309,12 @@ class WaveletUNet(nn.Module):
 
         self.input_conv = nn.Conv2d(in_channels, features[0], 3, padding=1)
 
-
         self.encoder_blocks = nn.ModuleList()
         self.downsample_blocks = nn.ModuleList()
         self.res_blocks = nn.ModuleList()
 
         for i in range(len(features) - 1):
             use_attn = i >= len(features) // 2
-
             self.encoder_blocks.append(nn.ModuleList([
                 ResBlock(features[i], features[i], time_dim, emotion_dim, use_cross_attn=use_attn),
                 ResBlock(features[i], features[i], time_dim, emotion_dim, use_cross_attn=use_attn)
@@ -459,7 +463,7 @@ class WaveletDiffusionModel(nn.Module):
         return loss
 
     @torch.no_grad()
-    def sample(self, src_image, target_emotion_id, num_steps=100, denoising_strength=1.0):
+    def sample(self, src_image, target_emotion_id, num_steps=100, denoising_strength=0.2):
         """
         inference → dùng DDIM sampling để sinh ảnh mới theo cảm xúc mục tiêu.
 
@@ -476,7 +480,7 @@ class WaveletDiffusionModel(nn.Module):
 
         # Tính toán start timestep dựa trên denoising_strength
         # Với strength cao hơn = nhiễu nhiều hơn = thay đổi nhiều hơn
-        start_timestep = int((1.0 - denoising_strength) * self.num_timesteps)
+        start_timestep = int(denoising_strength * self.num_timesteps)
         start_timestep = max(1, start_timestep)  # Ít nhất là 1
 
         # Tạo timesteps từ start_timestep về 0
@@ -502,6 +506,51 @@ class WaveletDiffusionModel(nn.Module):
             alpha_prev = self.alphas_cumprod[timesteps[i+1].item()] if i < len(timesteps) - 1 else torch.tensor(1.0, device=device)
             alpha_t = alpha_t.to(device)
             alpha_prev = alpha_prev.to(device)
+            pred_x0 = (x - torch.sqrt(1 - alpha_t) * noise_pred) / torch.sqrt(alpha_t)
+            pred_x0 = torch.clamp(pred_x0, -3, 3)
+
+            if i < len(timesteps) - 1:
+                x = torch.sqrt(alpha_prev) * pred_x0 + torch.sqrt(1 - alpha_prev) * noise_pred
+            else:
+                x = pred_x0
+
+        result = self.iwt(x)
+        return torch.clamp(result, -1, 1)
+
+    def sample_full_steps(self, src_image, target_emotion_id, denoising_strength=0.2):
+        """
+        Full step sampling using all timesteps for debugging/comparison
+        """
+        device = src_image.device
+        B = src_image.shape[0]
+        src_wavelet = self.dwt(src_image)
+
+        # Use all timesteps for this version
+        start_timestep = int(denoising_strength * self.num_timesteps)
+        start_timestep = max(1, start_timestep)
+
+        # Generate all timesteps from start to 0
+        timesteps = torch.arange(start_timestep - 1, -1, -1, device=device)
+
+        # Add noise to source image
+        if start_timestep > 0:
+            noise = torch.randn_like(src_wavelet)
+            alpha_start = self.sqrt_alphas_cumprod[start_timestep]
+            sigma_start = self.sqrt_one_minus_alphas_cumprod[start_timestep]
+            x = alpha_start * src_wavelet + sigma_start * noise
+        else:
+            x = src_wavelet
+
+        # Full timestep sampling
+        for i, t in enumerate(timesteps):
+            t_tensor = torch.full((B,), t.item(), device=device, dtype=torch.long)
+            noise_pred = self.unet(x, t_tensor, target_emotion_id, src_image)
+
+            alpha_t = self.alphas_cumprod[t.item()]
+            alpha_prev = self.alphas_cumprod[timesteps[i+1].item()] if i < len(timesteps) - 1 else torch.tensor(1.0, device=device)
+            alpha_t = alpha_t.to(device)
+            alpha_prev = alpha_prev.to(device)
+
             pred_x0 = (x - torch.sqrt(1 - alpha_t) * noise_pred) / torch.sqrt(alpha_t)
             pred_x0 = torch.clamp(pred_x0, -3, 3)
 

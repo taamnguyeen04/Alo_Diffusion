@@ -9,6 +9,10 @@ from tqdm import tqdm
 import lpips
 from criterions import *
 from icecream import ic
+import math
+import matplotlib.pyplot as plt
+from skimage.metrics import structural_similarity as ssim
+
 # pip install insightface
 
 def save_checkpoint(filepath, epoch, step, model, optimizer, loss):
@@ -96,21 +100,24 @@ def train():
     # Device setup
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    batch_size = 4
+    # Hyperparameters - Reduced batch size for memory
+    batch_size = 32
     lr = 1e-4
-    num_epochs = 100
+    num_epochs = 1
     image_size = 224
     labels = ["Neutral", "Happy", "Sad", "Surprise", "Fear", "Disgust", "Anger"]
 
     print(f"Batch size: {batch_size}")
     print(f"Device: {device}")
 
-    lambda_ddpm = 1.0
-    lambda_wav_ll = 0.1
-    lambda_wav_hi = 0.2
-    lambda_dan_expr = 2.0  # Tăng mạnh để ép model học cảm xúc
-    lambda_id = 0.1  # Giảm để cho phép thay đổi nhiều hơn
-    lambda_lpips = 0.05
+    # Loss weights - sử dụng DAN emotion model
+    lambda_ddpm = 2.0
+    lambda_wav_ll = 0.6
+    lambda_wav_hi = 0.5
+    lambda_dan_expr = 1.6
+    lambda_id = 0.8
+    lambda_lpips = 0.5
+
 
     # Directories
     log_dir = "WaveletDiffusion5/runs/exp"
@@ -144,25 +151,31 @@ def train():
     train_dataloader = DataLoader(
         dataset=train_dataset,
         batch_size=batch_size,
-        num_workers=4,
+        num_workers=os.cpu_count(),  # dùng hết CPU core logic
         shuffle=True,
-        drop_last=True
+        drop_last=True,
+        pin_memory=True,  # copy CPU→GPU nhanh hơn
+        persistent_workers=True,  # tránh spawn lại worker mỗi epoch
+        prefetch_factor=4  # mỗi worker load trước nhiều batch
     )
 
     val_dataloader = DataLoader(
         dataset=val_dataset,
         batch_size=batch_size,
-        num_workers=4,
+        num_workers=min(4, os.cpu_count()),
         shuffle=False,
         drop_last=True
     )
     print(f"Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}")
 
-    # Models
     print("Building models...")
 
     model = WaveletDiffusionModel(num_emotions=len(labels)).to(device)
     emotion_model = Emotion_model()
+
+    # Freeze DAN emotion model parameters
+    for param in emotion_model.model.parameters():
+        param.requires_grad = False
 
     import torchvision.models as models
     resnet50 = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1).to(device)
@@ -191,7 +204,48 @@ def train():
         mse = ((x - x_rec) ** 2).mean().item()
         print("DWT/IWT roundtrip MSE:", mse)
 
-    # Optimizer
+    # PSNR
+    rmse = math.sqrt(mse)
+    psnr = 20 * math.log10(2.0 / (rmse + 1e-12))  # dynamic range 2 for [-1,1]
+    print('MSE', mse, 'PSNR', psnr)
+
+    # # SSIM per image (với batch x và x_rec dạng torch tensor)
+    # x_np = x.cpu().numpy().transpose(0, 2, 3, 1)  # (B, H, W, C)
+    # xrec_np = x_rec.cpu().numpy().transpose(0, 2, 3, 1)
+    #
+    # for i in range(x_np.shape[0]):
+    #     # Chuyển ảnh về [0,1] và cắt biên an toàn
+    #     img1 = np.clip((x_np[i] + 1) / 2, 0, 1)
+    #     img2 = np.clip((xrec_np[i] + 1) / 2, 0, 1)
+    #
+    #     # Xác định kích thước cửa sổ hợp lệ
+    #     win_size = min(7, img1.shape[0], img1.shape[1])
+    #     if win_size % 2 == 0:
+    #         win_size -= 1
+    #     win_size = max(win_size, 3)  # luôn >=3 và lẻ
+    #
+    #     try:
+    #         # Dùng channel_axis=-1 (chuẩn cho scikit-image >= 0.19)
+    #         s = ssim(img1, img2, channel_axis=-1, win_size=win_size, data_range=1.0)
+    #     except TypeError:
+    #         # fallback cho bản cũ (<0.19) vẫn còn multichannel
+    #         s = ssim(img1, img2, multichannel=True, win_size=win_size, data_range=1.0)
+    #
+    #     print(f"SSIM image {i}: {s:.6f}")
+    #
+    # s = ssim(img1, img2, channel_axis=-1, win_size=win_size, data_range=1.0)
+    # print("SSIM image", i, s)
+    #
+    # plt.subplot(1, 2, 1)
+    # plt.imshow((x_np[2] + 1) / 2)
+    # plt.title("Original")
+    #
+    # plt.subplot(1, 2, 2)
+    # plt.imshow((xrec_np[2] + 1) / 2)
+    # plt.title("Reconstructed")
+    # plt.show()
+
+    # # Optimizer
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=lr,
@@ -214,7 +268,7 @@ def train():
             model.train()
 
             epoch_bar = tqdm(enumerate(train_dataloader), total=len(train_dataloader),
-                           desc=f"Epoch {epoch}/{num_epochs}")
+                             desc=f"Epoch {epoch}/{num_epochs}")
 
             for i, (img_real, expr_org, _, _) in epoch_bar:  # Bỏ valence, arousal
                 img_real = img_real.to(device)
@@ -231,25 +285,41 @@ def train():
                 noise_pred = model.unet(x_noisy, t, expr_trg, img_real)
                 ddpm_loss = F.l1_loss(noise_pred, noise)
 
-                # Generate images to calculate dan_expr_loss every batch
-                with torch.no_grad():
-                    generated_img = model.sample(img_real, expr_trg, num_steps=75, denoising_strength=1)
+                # Calculate DAN loss directly from pred_x0 (differentiable) with time-based weighting
+                alpha_t = model.alphas_cumprod[t][:, None, None, None]
+                sqrt_alpha_t = torch.sqrt(alpha_t)
+                sqrt_one_minus_alpha_t = torch.sqrt(1 - alpha_t)
 
-                # Calculate dan_expr_loss for every batch
-                generated_img_norm = (generated_img + 1) / 2  # [-1,1] -> [0,1]
-                dan_prediction_list = []
-                for j in range(generated_img_norm.shape[0]):
-                    single_img = generated_img_norm[j:j+1]  # (1, 3, H, W)
-                    dan_input = F.interpolate(single_img, size=(224, 224), mode='bilinear')
-                    mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(dan_input.device)
-                    std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(dan_input.device)
-                    dan_input = (dan_input - mean) / std
-                    with torch.no_grad():
-                        dan_out, _, _ = emotion_model.model(dan_input)
-                        dan_prediction_list.append(dan_out)
+                # Predict x0 from noise prediction
+                pred_x0_wavelet = (x_noisy - sqrt_one_minus_alpha_t * noise_pred) / sqrt_alpha_t
 
-                dan_predictions = torch.cat(dan_prediction_list, dim=0)
-                dan_expr_loss = F.cross_entropy(dan_predictions, expr_trg)
+                # Convert wavelet back to image space
+                pred_x0_img = iwt(pred_x0_wavelet)
+                pred_x0_img = torch.clamp(pred_x0_img, -1, 1)
+
+                # Normalize to [0,1] and resize for DAN
+                pred_x0_norm = (pred_x0_img + 1) / 2
+                dan_input = F.interpolate(pred_x0_norm, size=(224, 224), mode='bilinear')
+
+                # ImageNet normalization for DAN
+                mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(dan_input.device)
+                std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(dan_input.device)
+                dan_input = (dan_input - mean) / std
+
+                # Get DAN predictions (differentiable)
+                dan_out, _, _ = emotion_model.model(dan_input)
+
+                # Time-based weighting: only apply DAN loss for low noise timesteps
+                t_thresh = int(0.3 * model.num_timesteps)  # Only for t < 30% of total timesteps
+                time_weights = (t < t_thresh).float()  # (B,)
+
+                # Calculate per-sample loss and apply time weighting
+                per_sample_dan_loss = F.cross_entropy(dan_out, expr_trg, reduction='none')  # (B,)
+                dan_expr_loss = (per_sample_dan_loss * time_weights).sum() / (time_weights.sum().clamp_min(1.0))
+
+                # If no valid timesteps, set loss to 0
+                if time_weights.sum() == 0:
+                    dan_expr_loss = torch.tensor(0.0, device=device, requires_grad=True)
 
                 current_losses = {
                     'dan_expr': dan_expr_loss,
@@ -259,11 +329,11 @@ def train():
                 current_lambda_id = weight_updates.get('lambda_id', lambda_id)
                 current_lambda_dan_expr = weight_updates.get('lambda_dan_expr', lambda_dan_expr)
 
-                if i % 20 == 0:
+                if i % 50 == 0:
                     # ic(dan_predictions, expr_trg, expr_org)
                     with torch.no_grad():
                         # Sử dụng denoising strength rất cao để ép model học thay đổi cảm xúc mạnh
-                        generated_img = model.sample(img_real, expr_trg, num_steps=75, denoising_strength=0.1)
+                        generated_img = model.sample(img_real, expr_trg, num_steps=75, denoising_strength=0.2)
 
                     img_wavelet_full = dwt(img_real)
                     gen_wavelet = dwt(generated_img)
@@ -287,9 +357,9 @@ def train():
                     emotion_wav_ll_loss = F.l1_loss(gen_ll, same_ll) * 0.1
 
                     wav_loss = (lambda_wav_ll * wav_loss_ll +
-                               lambda_wav_hi * wav_loss_hi +
-                               emotion_wav_hi_loss +
-                               emotion_wav_ll_loss)
+                                lambda_wav_hi * wav_loss_hi +
+                                emotion_wav_hi_loss +
+                                emotion_wav_ll_loss)
 
                     real_norm = (img_real + 1) / 2  # [-1,1] -> [0,1]
                     gen_norm = (generated_img + 1) / 2
@@ -313,16 +383,16 @@ def train():
 
                     # ===== TOTAL LOSS (with adaptive weights) =====
                     total_loss = (
-                        lambda_ddpm * ddpm_loss +
-                        current_lambda_dan_expr * dan_expr_loss +
-                        wav_loss +
-                        current_lambda_id * id_loss +
-                        lambda_lpips * lpips_loss
+                            lambda_ddpm * ddpm_loss +
+                            current_lambda_dan_expr * dan_expr_loss +
+                            wav_loss +
+                            current_lambda_id * id_loss +
+                            lambda_lpips * lpips_loss
                     )
                 else:
                     total_loss = (
-                        lambda_ddpm * ddpm_loss +
-                        current_lambda_dan_expr * dan_expr_loss
+                            lambda_ddpm * ddpm_loss +
+                            current_lambda_dan_expr * dan_expr_loss
                     )
                     wav_loss = torch.tensor(0.0, device=device)
                     id_loss = torch.tensor(0.0, device=device)
@@ -344,7 +414,7 @@ def train():
                 })
 
                 # TensorBoard logging
-                if i % 10 == 0:
+                if i % 50 == 0:
                     step = epoch * len(train_dataloader) + i
                     writer.add_scalar("Loss/Total", total_loss.item(), step)
                     writer.add_scalar("Loss/DDPM", ddpm_loss.item(), step)
@@ -353,10 +423,8 @@ def train():
                     writer.add_scalar("Loss/Identity", id_loss.item(), step)
                     writer.add_scalar("Loss/LPIPS", lpips_loss.item(), step)
 
-                if i % 100 == 0:
+                if i % 500 == 0:
                     save_checkpoint(model_path, epoch, i, model, optimizer, total_loss)
-
-                if i % 200 == 0:
                     print("Generating validation images...")
                     model.eval()
                     with torch.no_grad():
@@ -389,6 +457,7 @@ def train():
     print("Training completed!")
     writer.close()
 
+#DWT/IWT roundtrip MSE: 4.485536833458148e-14
 
 if __name__ == '__main__':
     train()

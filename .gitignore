@@ -4,4 +4,7 @@
 /VAE/*
 /chunks1024/*
 /WaveletDiffusion
+/demo_all_emotions
+/demo_output
+/WaveletDiffusion5
 affecnet7_epoch6_acc0.6569.pth
