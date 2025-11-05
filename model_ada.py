@@ -134,15 +134,9 @@ class CrossAttention(nn.Module):
 
 class ResBlock(nn.Module):
     """Residual block kết hợp cả timestep và emotion embedding."""
-    def __init__(self, in_channels, out_channels, time_dim, emotion_dim, dropout=0.1, use_cross_attn=False, use_film=True, use_adagn=False):
+    def __init__(self, in_channels, out_channels, time_dim, emotion_dim, dropout=0.1, use_cross_attn=False):
         super().__init__()
         self.use_cross_attn = use_cross_attn
-        self.use_film = use_film
-        self.use_adagn = use_adagn
-
-        # Cannot use both FiLM and AdaGN simultaneously
-        if self.use_film and self.use_adagn:
-            raise ValueError("Cannot use both FiLM and AdaGN. Choose one.")
 
         self.norm1 = nn.GroupNorm(8, in_channels)
         self.conv1 = nn.Conv2d(in_channels, out_channels, 3, padding=1)
@@ -150,31 +144,17 @@ class ResBlock(nn.Module):
         self.time_mlp = nn.Linear(time_dim, out_channels)
         self.emotion_mlp = nn.Linear(emotion_dim, out_channels)
 
-        # FiLM layers for emotion conditioning
-        if self.use_film:
-            self.film_gamma = nn.Linear(emotion_dim, out_channels)
-            self.film_beta = nn.Linear(emotion_dim, out_channels)
-
-            # Initialize FiLM to be identity at start: gamma=1, beta=0
-            # This ensures stable training - starts with h' = 1*h + 0 = h
-            # Then slowly learns to modulate features
-            nn.init.zeros_(self.film_gamma.weight)
-            nn.init.ones_(self.film_gamma.bias)   # gamma starts at 1
-            nn.init.zeros_(self.film_beta.weight)
-            nn.init.zeros_(self.film_beta.bias)   # beta starts at 0
-
         # AdaGN (Adaptive Group Normalization) for emotion conditioning
-        if self.use_adagn:
-            # Normalization layer without learnable affine parameters
-            self.adagn_norm = nn.GroupNorm(8, out_channels, affine=False)
+        # Normalization layer without learnable affine parameters
+        self.adagn_norm = nn.GroupNorm(8, out_channels, affine=False)
 
-            # Single MLP predicts both gamma and beta (more efficient)
-            self.emotion_modulation = nn.Linear(emotion_dim, 2 * out_channels)
+        # Single MLP predicts both gamma and beta (more efficient)
+        self.emotion_modulation = nn.Linear(emotion_dim, 2 * out_channels)
 
-            # Initialize AdaGN to be identity: gamma≈0, beta≈0
-            # So h' = h_norm * (1 + 0) + 0 = h_norm (normalized features)
-            nn.init.zeros_(self.emotion_modulation.weight)
-            nn.init.zeros_(self.emotion_modulation.bias)
+        # Initialize AdaGN to be identity: gamma≈0, beta≈0
+        # So h' = h_norm * (1 + 0) + 0 = h_norm (normalized features)
+        nn.init.zeros_(self.emotion_modulation.weight)
+        nn.init.zeros_(self.emotion_modulation.bias)
 
         if use_cross_attn:
             self.cross_attn = CrossAttention(out_channels, emotion_dim)
@@ -189,7 +169,7 @@ class ResBlock(nn.Module):
         else:
             self.shortcut = nn.Identity()
 
-    def forward(self, x, time_emb, emotion_emb, return_film_params=False):
+    def forward(self, x, time_emb, emotion_emb):
         h = self.norm1(x)
         h = F.silu(h)
         h = self.conv1(h)
@@ -198,39 +178,24 @@ class ResBlock(nn.Module):
         emotion_out = self.emotion_mlp(F.silu(emotion_emb))[:, :, None, None]
         h = h + time_out + emotion_out
 
-        # Apply emotion conditioning
-        gamma = None
-        beta = None
+        # Apply AdaGN (Adaptive Group Normalization)
+        # Step 1: Normalize features to mean=0, std=1 per group
+        h_normalized = self.adagn_norm(h)
 
-        if self.use_film:
-            # FiLM conditioning: h' = gamma * h + beta
-            # Initialized with gamma=1, beta=0 for stability
-            emotion_emb_norm = F.layer_norm(emotion_emb, (emotion_emb.shape[-1],))
-            emotion_feat = F.silu(emotion_emb_norm)
+        # Step 2: Predict modulation parameters from emotion
+        emotion_emb_norm = F.layer_norm(emotion_emb, (emotion_emb.shape[-1],))
+        emotion_feat = F.silu(emotion_emb_norm)
+        emotion_mod = self.emotion_modulation(emotion_feat)  # (B, 2*C)
 
-            gamma = self.film_gamma(emotion_feat)[:, :, None, None]
-            beta = self.film_beta(emotion_feat)[:, :, None, None]
-            h = gamma * h + beta
+        # Split into gamma and beta
+        gamma, beta = torch.chunk(emotion_mod, 2, dim=1)  # Each: (B, C)
+        gamma = gamma[:, :, None, None]
+        beta = beta[:, :, None, None]
 
-        elif self.use_adagn:
-            # AdaGN conditioning: h' = h_norm * (1 + gamma) + beta
-            # Step 1: Normalize features to mean=0, std=1 per group
-            h_normalized = self.adagn_norm(h)
-
-            # Step 2: Predict modulation parameters from emotion
-            emotion_emb_norm = F.layer_norm(emotion_emb, (emotion_emb.shape[-1],))
-            emotion_feat = F.silu(emotion_emb_norm)
-            emotion_mod = self.emotion_modulation(emotion_feat)  # (B, 2*C)
-
-            # Split into gamma and beta
-            gamma, beta = torch.chunk(emotion_mod, 2, dim=1)  # Each: (B, C)
-            gamma = gamma[:, :, None, None]
-            beta = beta[:, :, None, None]
-
-            # Step 3: Modulate normalized features
-            # h' = h_norm * (1 + gamma) + beta
-            # This allows gamma≈0, beta≈0 to produce identity transform
-            h = h_normalized * (1 + gamma) + beta
+        # Step 3: Modulate normalized features
+        # h' = h_norm * (1 + gamma) + beta
+        # This allows gamma≈0, beta≈0 to produce identity transform
+        h = h_normalized * (1 + gamma) + beta
 
         if self.use_cross_attn:
             h = self.cross_attn(h, emotion_emb)
@@ -240,26 +205,22 @@ class ResBlock(nn.Module):
         h = self.dropout(h)
         h = self.conv2(h)
 
-        output = h + self.shortcut(x)
-
-        if return_film_params:
-            return output, gamma, beta
-        return output
+        return h + self.shortcut(x)
 
 
 class FrequencyBottleneckBlock(nn.Module):
     """Xử lý đặc biệt cho tần số thấp, giữ nguyên tần số cao"""
-    def __init__(self, channels, time_dim, emotion_dim, use_film=True, use_adagn=False):
+    def __init__(self, channels, time_dim, emotion_dim):
         super().__init__()
         self.dwt = DWT()
         self.iwt = IWT()
 
         self.low_freq_processor = nn.Sequential(
-            ResBlock(channels, channels, time_dim, emotion_dim, use_film=use_film, use_adagn=use_adagn),
-            ResBlock(channels, channels, time_dim, emotion_dim, use_film=use_film, use_adagn=use_adagn)
+            ResBlock(channels, channels, time_dim, emotion_dim),
+            ResBlock(channels, channels, time_dim, emotion_dim)
         )
 
-    def forward(self, x, time_emb, emotion_emb, return_film_params=False):
+    def forward(self, x, time_emb, emotion_emb):
         x_freq = self.dwt(x)  # (B, 4*C, H/2, W/2)
 
         C = x.shape[1]
@@ -267,18 +228,11 @@ class FrequencyBottleneckBlock(nn.Module):
         x_hi = x_freq[:, C:, :, :]
 
         x_ll_processed = x_ll
-        film_params = []
         for layer in self.low_freq_processor:
-            if return_film_params:
-                x_ll_processed, gamma, beta = layer(x_ll_processed, time_emb, emotion_emb, return_film_params=True)
-                film_params.append((gamma, beta))
-            else:
-                x_ll_processed = layer(x_ll_processed, time_emb, emotion_emb)
+            x_ll_processed = layer(x_ll_processed, time_emb, emotion_emb)
 
         x_freq_out = torch.cat([x_ll_processed, x_hi], dim=1)
 
-        if return_film_params:
-            return self.iwt(x_freq_out), film_params
         return self.iwt(x_freq_out)
 
 
@@ -359,22 +313,18 @@ class WaveletUNet(nn.Module):
                  features=[64, 128, 256, 512],
                  time_dim=256,
                  emotion_dim=64,
-                 num_emotions=8,
-                 use_film=True,
-                 use_adagn=False):
+                 num_emotions=8):
         super().__init__()
 
         self.time_embedding = TimeEmbedding(time_dim)
         self.num_emotions = num_emotions
         self.emotion_dim = emotion_dim
-        self.use_film = use_film
-        self.use_adagn = use_adagn
 
         # Use learnable embedding instead of one-hot + projection
         self.emotion_embedding = nn.Embedding(num_emotions, emotion_dim)
 
         self.input_conv = nn.Conv2d(in_channels, features[0], 3, padding=1)
-
+        
         # self.debug_res_conn = DebugResidualConnection(
         #             save_dir='debug_artifacts',
         #             debug_freq=100,
@@ -382,7 +332,7 @@ class WaveletUNet(nn.Module):
         #         )
         # self.debugger = ArtifactDebugger(save_dir='debug_special')
         # self.training_step = 0
-
+        
         self.encoder_blocks = nn.ModuleList()
         self.downsample_blocks = nn.ModuleList()
         self.res_blocks = nn.ModuleList()
@@ -391,8 +341,8 @@ class WaveletUNet(nn.Module):
             use_attn = i >= len(features) // 2
 
             self.encoder_blocks.append(nn.ModuleList([
-                ResBlock(features[i], features[i], time_dim, emotion_dim, use_cross_attn=use_attn, use_film=use_film, use_adagn=use_adagn),
-                ResBlock(features[i], features[i], time_dim, emotion_dim, use_cross_attn=use_attn, use_film=use_film, use_adagn=use_adagn)
+                ResBlock(features[i], features[i], time_dim, emotion_dim, use_cross_attn=use_attn),
+                ResBlock(features[i], features[i], time_dim, emotion_dim, use_cross_attn=use_attn)
             ]))
 
             self.downsample_blocks.append(
@@ -404,9 +354,9 @@ class WaveletUNet(nn.Module):
             )
 
         self.bottleneck = nn.ModuleList([
-            FrequencyBottleneckBlock(features[-1], time_dim, emotion_dim, use_film=use_film, use_adagn=use_adagn),
-            ResBlock(features[-1], features[-1], time_dim, emotion_dim, use_film=use_film, use_adagn=use_adagn),
-            FrequencyBottleneckBlock(features[-1], time_dim, emotion_dim, use_film=use_film, use_adagn=use_adagn)
+            FrequencyBottleneckBlock(features[-1], time_dim, emotion_dim),
+            ResBlock(features[-1], features[-1], time_dim, emotion_dim),
+            FrequencyBottleneckBlock(features[-1], time_dim, emotion_dim)
         ])
 
         self.decoder_blocks = nn.ModuleList()
@@ -418,8 +368,8 @@ class WaveletUNet(nn.Module):
             )
 
             self.decoder_blocks.append(nn.ModuleList([
-                ResBlock(features[i-1] * 2, features[i-1], time_dim, emotion_dim, use_film=use_film, use_adagn=use_adagn),
-                ResBlock(features[i-1], features[i-1], time_dim, emotion_dim, use_film=use_film, use_adagn=use_adagn)
+                ResBlock(features[i-1] * 2, features[i-1], time_dim, emotion_dim),
+                ResBlock(features[i-1], features[i-1], time_dim, emotion_dim)
             ]))
 
         self.output_conv = nn.Sequential(
@@ -428,7 +378,7 @@ class WaveletUNet(nn.Module):
             nn.Conv2d(features[0], out_channels, 3, padding=1)
         )
 
-    def forward(self, x, t, emotion_id, src_image=None, return_aux=False, return_film_params=False):
+    def forward(self, x, t, emotion_id, src_image=None, return_aux=False):
         """
         Args:
             x: Noisy wavelet coefficients (B, 12, H/2, W/2)
@@ -436,7 +386,6 @@ class WaveletUNet(nn.Module):
             emotion_id: Target emotion ID (B,)
             src_image: Source RGB image for residual connections (B, 3, H, W)
             return_aux: Whether to return auxiliary predictions
-            return_film_params: Whether to return FiLM gamma/beta parameters
         """
         time_emb = self.time_embedding(t)
 
@@ -446,17 +395,12 @@ class WaveletUNet(nn.Module):
         x = self.input_conv(x)
         skip_connections = []
         hi_freq_skips = []
-        film_params = []
 
         for i, (encoder_block, downsample_block) in enumerate(
             zip(self.encoder_blocks, self.downsample_blocks)
         ):
             for block in encoder_block:
-                if return_film_params:
-                    x, gamma, beta = block(x, time_emb, emotion_emb, return_film_params=True)
-                    film_params.append((gamma, beta))
-                else:
-                    x = block(x, time_emb, emotion_emb)
+                x = block(x, time_emb, emotion_emb)
 
             if src_image is not None:
                 res_feat = self.res_blocks[i](src_image)
@@ -466,7 +410,7 @@ class WaveletUNet(nn.Module):
                 #     stats = self.debugger.visualize_features(x, res_feat, i)
                 #     if stats['res_std'] > 100:
                 #         print(f"⚠️ Block {i}: High std = {stats['res_std']:.2f}")
-
+                        
             skip_connections.append(x)
 
             x, hi_freq = downsample_block(x, time_emb, emotion_emb)
@@ -474,17 +418,9 @@ class WaveletUNet(nn.Module):
 
         for block in self.bottleneck:
             if isinstance(block, FrequencyBottleneckBlock):
-                if return_film_params:
-                    x, bottleneck_film = block(x, time_emb, emotion_emb, return_film_params=True)
-                    film_params.extend(bottleneck_film)
-                else:
-                    x = block(x, time_emb, emotion_emb)
+                x = block(x, time_emb, emotion_emb)
             else:
-                if return_film_params:
-                    x, gamma, beta = block(x, time_emb, emotion_emb, return_film_params=True)
-                    film_params.append((gamma, beta))
-                else:
-                    x = block(x, time_emb, emotion_emb)
+                x = block(x, time_emb, emotion_emb)
 
         for i, (upsample_block, decoder_block) in enumerate(
             zip(self.upsample_blocks, self.decoder_blocks)
@@ -496,16 +432,9 @@ class WaveletUNet(nn.Module):
             x = torch.cat([x, skip], dim=1)
 
             for block in decoder_block:
-                if return_film_params:
-                    x, gamma, beta = block(x, time_emb, emotion_emb, return_film_params=True)
-                    film_params.append((gamma, beta))
-                else:
-                    x = block(x, time_emb, emotion_emb)
+                x = block(x, time_emb, emotion_emb)
 
         noise_pred = self.output_conv(x)
-
-        if return_film_params:
-            return noise_pred, film_params
         return noise_pred
 
 
@@ -517,22 +446,18 @@ class WaveletDiffusionModel(nn.Module):
                  beta_start=1e-4,
                  beta_end=2e-2,
                  use_emotion_smooth=True,
-                 smooth_weight=0.1,
-                 use_film=True,
-                 use_adagn=False):
+                 smooth_weight=0.1):
         super().__init__()
 
         self.num_timesteps = num_timesteps
         self.num_emotions = num_emotions
         self.use_emotion_smooth = use_emotion_smooth
         self.smooth_weight = smooth_weight
-        self.use_film = use_film
-        self.use_adagn = use_adagn
 
         self.dwt = DWT()
         self.iwt = IWT()
 
-        self.unet = WaveletUNet(num_emotions=num_emotions, use_film=use_film, use_adagn=use_adagn)
+        self.unet = WaveletUNet(num_emotions=num_emotions)
 
         # Register gradient hook on first conv layer
         def grad_hook(module, grad_in, grad_out):
@@ -577,7 +502,7 @@ class WaveletDiffusionModel(nn.Module):
         return loss
 
     @torch.no_grad()
-    def sample(self, src_image, target_emotion_id, num_steps=100, denoising_strength=0.2, return_film_params=False):
+    def sample(self, src_image, target_emotion_id, num_steps=100, denoising_strength=0.2):
         """
         inference → dùng DDIM sampling để sinh ảnh mới theo cảm xúc mục tiêu.
 
@@ -587,7 +512,6 @@ class WaveletDiffusionModel(nn.Module):
             num_steps: Số bước sampling
             denoising_strength: Mức độ denoising (0.0-1.0).
                               1.0 = thay đổi hoàn toàn, 0.0 = không thay đổi
-            return_film_params: Whether to return FiLM gamma/beta parameters from last step
         """
         device = src_image.device
         B = src_image.shape[0]
@@ -614,16 +538,9 @@ class WaveletDiffusionModel(nn.Module):
             # Trường hợp đặc biệt: không thêm nhiễu (strength = 0)
             x = src_wavelet
 
-        film_params = None
         for i, t in enumerate(timesteps):
             t_tensor = torch.full((B,), t.item(), device=device, dtype=torch.long)
-            # Get FiLM params only on the last step
-            is_last = (i == len(timesteps) - 1)
-            if return_film_params and is_last:
-                noise_pred, film_params = self.unet(x, t_tensor, target_emotion_id, src_image, return_film_params=True)
-            else:
-                noise_pred = self.unet(x, t_tensor, target_emotion_id, src_image)
-
+            noise_pred = self.unet(x, t_tensor, target_emotion_id, src_image)
             alpha_t = self.alphas_cumprod[t.item()]
             alpha_prev = self.alphas_cumprod[timesteps[i+1].item()] if i < len(timesteps) - 1 else torch.tensor(1.0, device=device)
             alpha_t = alpha_t.to(device)
@@ -637,9 +554,6 @@ class WaveletDiffusionModel(nn.Module):
                 x = pred_x0
 
         result = self.iwt(x)
-
-        if return_film_params:
-            return result, film_params
         return result
 
     def sample_full_steps(self, src_image, target_emotion_id, denoising_strength=0.2):

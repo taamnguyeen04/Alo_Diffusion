@@ -11,8 +11,9 @@ import torch.nn.functional as F
 import time
 
 class Affectnet(Dataset):
-    def __init__(self, root, is_train, transform=None):
-        image_path = os.path.join(root, "Manually_Annotated_Images", "Manually_Annotated_Images")
+    def __init__(self, is_train, transform=None, root=None):
+        root = "C:/Users/tam/Desktop/Data/FEG"
+        image_path = os.path.join(root, "Manually_Annotated_Images")
         self.transform = transform
 
         if is_train:
@@ -54,191 +55,11 @@ class Affectnet(Dataset):
             next_item = (item + 1) % len(self.list_image)
             return self.__getitem__(next_item)
 
-
-def save_dataset_in_chunks(root, is_train=True, image_size=224, batch_size=1024, num_workers=0):
-    transform = Compose([
-        Resize((image_size, image_size)),
-        ToTensor(),
-        Normalize(mean=[0.5402, 0.4410, 0.3938], std=[0.2914, 0.2657, 0.2609]),
-    ])
-
-    dataset = Affectnet(root=root, is_train=is_train, transform=transform)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
-
-    os.makedirs("chunks1024", exist_ok=True)
-    prefix = "train" if is_train else "val"
-    for idx, (imgs, exprs, vals, aros) in enumerate(tqdm(dataloader, desc=f"Saving {prefix} batches")):
-        save_file = f"chunks1024/{prefix}_{idx:04d}.pt"
-        torch.save({
-            "images": imgs,
-            "expressions": exprs,
-            "valences": vals,
-            "arousals": aros,
-        }, save_file)
-
-    print(f"✅ Saved {idx + 1} batches to folder 'chunks1024/' as {prefix}_*.pt")
-
-class AffectnetPt(Dataset):
-    def __init__(self, root, is_train, transform=None):
-        root = "chunks1024"
-        self.transform = transform
-        if is_train:
-            path = os.path.join(root, "train")
-        else:
-            path = os.path.join(root, "val")
-        self.list_file = [os.path.join(path, x) for x in os.listdir(path)]
-        self.data_index = []
-        for file_path in self.list_file:
-            data = torch.load(file_path, map_location="cpu")
-            num_samples = data["images"].shape[0]
-            for i in range(num_samples):
-                self.data_index.append((file_path, i))
-
-    def __len__(self):
-        return len(self.data_index)
-
-    def __getitem__(self, idx):
-        file_path, inner_idx = self.data_index[idx]
-
-        data = torch.load(file_path, map_location="cpu")
-        img = data["images"][inner_idx]
-        expr = data["expressions"][inner_idx]
-        val = data["valences"][inner_idx]
-        aro = data["arousals"][inner_idx]
-
-        if self.transform:
-            img = self.transform(img)
-        img = F.interpolate(img.unsqueeze(0), size=(224, 224), mode='bilinear', align_corners=False).squeeze(0)
-
-        return img, expr, val, aro
-
-def measure_load_time(dataset_class, dataset_name, root, is_train=True, transform=None, batch_size=64, num_workers=4):
-    dataset = dataset_class(root=root, is_train=is_train, transform=transform)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
-
-    print(f"/n⏳ Loading from s{dataset_name}...")
-    start_time = time.time()
-
-    total = 0
-    for batch in dataloader:
-        total += batch[0].size(0)
-
-    end_time = time.time()
-    duration = end_time - start_time
-    print(f"✅ {dataset_name}: Loaded {total} samples in {duration:.2f} seconds")
-
-
-def cout(a):
-    print("****************************")
-    print(a)
-    print(type(a))
-    print("****************************")
-
-
-
-class AffectnetWavelet(Dataset):
-    def __init__(self, root, is_train, transform=None):
-        image_path = os.path.join(root, "LL_tensor")
-        self.transform = transform
-
-        if is_train:
-            label_path = os.path.join(root, "training.csv")
-        else:
-            label_path = os.path.join(root, "validation.csv")
-
-        list_label = pd.read_csv(label_path)
-        valid_labels = list_label[list_label['expression'] < 8].copy()
-
-        def to_tensor_path(x):
-            pt_path = x.replace(".jpg", ".pt").replace(".png", ".pt")
-            return os.path.join(image_path, pt_path)
-
-        valid_labels['full_tensor_path'] = valid_labels['subDirectory_filePath'].apply(to_tensor_path)
-
-        valid_labels = valid_labels[valid_labels['full_tensor_path'].apply(os.path.isfile)]
-
-        self.list_image = valid_labels['full_tensor_path'].tolist()
-        self.list_label_expression = valid_labels['expression'].tolist()
-        self.list_valence = valid_labels['valence'].tolist()
-        self.list_arousal = valid_labels['arousal'].tolist()
-        # self.list_landmarks = valid_labels['facial_landmarks'].tolist()
-
-    def __len__(self):
-        return len(self.list_image)
-
-    def __getitem__(self, item):
-        try:
-            image_tensor = torch.load(self.list_image[item])
-            image_tensor = F.interpolate(image_tensor.unsqueeze(0), size=(128, 128), mode='bilinear',
-                                         align_corners=False).squeeze(0)
-            if self.transform:
-                image_tensor = self.transform(image_tensor)
-
-            expr = torch.tensor(self.list_label_expression[item], dtype=torch.long)
-            valence = torch.tensor(self.list_valence[item], dtype=torch.float32)
-            arousal = torch.tensor(self.list_arousal[item], dtype=torch.float32)
-
-            # raw_landmarks = self.list_landmarks[item]
-            # landmark_tensor = torch.tensor([float(x) for x in raw_landmarks.split(';')], dtype=torch.float32)
-
-            return image_tensor, expr, valence, arousal#, landmark_tensor
-
-        except Exception as e:
-            print(f"Error loading sample {item}: {e}")
-            next_item = (item + 1) % len(self)
-            return self.__getitem__(next_item)
-
-
 if __name__ == '__main__':
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     transform = Compose([
         Resize((224, 224)),
         ToTensor()
     ])
-    #
-    dataset = Affectnet(root="C:/Users/tam/Documents/data/FEG", is_train=True, transform=transform)
+    dataset = Affectnet(root="C:/Users/tam/Desktop/Data/FEG", is_train=True, transform=transform)
     print(len(dataset))
-    # img, expr, valence, arousal = dataset[0] 283901
-    # print("Batch:", img.shape)
-    # print("Expressions:", expr)
-    # print("Valence:", valence)
-    # print("Arousal:", arousal)
-    # # img = img.permute(1, 2, 0).numpy()  # (H, W, C)
-    # # img = (img * 255).clip(0, 255).astype(np.uint8)
-    # #
-    # # img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-    # # cv2.imshow(f"Expr:{expr.item()}, Val:{valence:.2f}, Aro:{arousal:.2f}", img_bgr)
-    # # cv2.waitKey(0)
-    # # cv2.destroyAllWindows()
-    # img_pil = to_pil_image(img)
-    # img_pil.show(title="Affectnet")
-
-
-
-    # root = "C:/Users/tam/Documents/data/Affectnet"
-    #
-    # save_dataset_in_chunks(
-    #     root=root,
-    #     is_train=True
-    #     # save_path="affectnet_train.pt"
-    # )
-    #
-    # save_dataset_in_chunks(
-    #     root=root,
-    #     is_train=False
-    #     # save_path="affectnet_val.pt"
-    # )
-
-    # transform = Normalize(mean=[0.5402, 0.4410, 0.3938], std=[0.2914, 0.2657, 0.2609])
-    # dataset = AffectnetPt(root="chunks1024", is_train=False, transform=transform)
-    # cout((dataset))
-    # # cout(len(dataset[1][3]))
-    # csv_root = "C:/Users/tam/Documents/data/Affectnet"  # thư mục chứa Manually_Annotated_Images, training.csv
-    # pt_root = "chunks1024"  # thư mục chứa train/*.pt, val/*.pt
-    #
-    # # So sánh tốc độ
-    # measure_load_time(Affectnet, "AffectNet CSV + JPG", csv_root, is_train=True, transform=transform)
-    # measure_load_time(AffectnetPt, "AffectNet .pt chunks", pt_root, is_train=True)
-    # dataset = AffectnetWavelet(root="C:/Users/tam/Documents/data/Affectnet", is_train=True)
-    # print(len(dataset))
-    # print(dataset[0])
