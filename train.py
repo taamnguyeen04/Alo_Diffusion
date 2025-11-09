@@ -8,6 +8,7 @@ from dataset import Affectnet
 from tqdm import tqdm
 import lpips
 from criterions import *
+from loss_conflict_analyzer import LossConflictAnalyzer
 from icecream import ic
 import math
 import matplotlib.pyplot as plt
@@ -181,8 +182,8 @@ def train():
 
     # Emotion conditioning method toggle
     # Note: Only one can be True at a time (FiLM or AdaGN)
-    use_film = False  # FiLM: Feature-wise Linear Modulation
-    use_adagn = True   # AdaGN: Adaptive Group Normalization
+    use_film = True  # FiLM: Feature-wise Linear Modulation
+    use_adagn = False   # AdaGN: Adaptive Group Normalization
 
     print(f"Batch size: {batch_size}")
     print(f"Device: {device}")
@@ -362,6 +363,16 @@ def train():
     # When using DataParallel, need to load to module (reuse base_model variable)
     start_epoch, best_loss = load_checkpoint(model_path, base_model, optimizer, best_loss, device)
 
+    # Initialize Loss Conflict Analyzer
+    print("Initializing Loss Conflict Analyzer...")
+    conflict_analyzer = LossConflictAnalyzer(
+        loss_names=['ddpm', 'dan_expr', 'wav', 'id', 'lpips', 'cycle'],
+        model=base_model,
+        log_freq=100,  # Analyze every 100 iterations
+        buffer_size=500,
+        save_dir=os.path.join(log_dir, 'conflict_analysis')
+    )
+
     # Fixed validation samples
     x_fixed, expr_fixed, _, _ = next(iter(val_dataloader))
     x_fixed = x_fixed.to(device)
@@ -479,6 +490,16 @@ def train():
                             lambda_lpips * lpips_loss +                             
                             lambda_cycle * cycle_loss
                     )
+                    
+                    # Analyze loss conflicts
+                    conflict_analyzer.analyze_step({
+                        'ddpm': ddpm_loss,
+                        'dan_expr': dan_expr_loss,
+                        'wav': wav_loss,
+                        'id': id_loss,
+                        'lpips': lpips_loss,
+                        'cycle': cycle_loss
+                    }, writer=writer)
                 else:
                     total_loss = (
                             lambda_ddpm * ddpm_loss +
@@ -487,6 +508,17 @@ def train():
                     wav_loss = torch.tensor(0.0, device=device)
                     id_loss = torch.tensor(0.0, device=device)
                     lpips_loss = torch.tensor(0.0, device=device)
+                    cycle_loss = torch.tensor(0.0, device=device)
+                    
+                    # Still track ddpm and dan_expr losses
+                    conflict_analyzer.analyze_step({
+                        'ddpm': ddpm_loss,
+                        'dan_expr': dan_expr_loss,
+                        'wav': wav_loss,
+                        'id': id_loss,
+                        'lpips': lpips_loss,
+                        'cycle': cycle_loss
+                    }, writer=writer)
 
                 # ===== BACKWARD PASS =====
                 optimizer.zero_grad()
@@ -628,6 +660,10 @@ def train():
         print("Training interrupted by user")
         if 'total_loss' in locals():
             save_checkpoint(model_path, epoch, i, base_model, optimizer, total_loss)
+    finally:
+        # Save final conflict analysis report
+        print("\nGenerating final conflict analysis report...")
+        conflict_analyzer.save_final_report()
 
     print("Training completed!")
     writer.close()
