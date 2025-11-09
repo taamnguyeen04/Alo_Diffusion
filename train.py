@@ -174,7 +174,7 @@ def train():
 
     # Hyperparameters - Reduced batch size for memory
     batch_size = 16
-    lr = 1e-4
+    lr = 5e-5
     num_epochs = 5
     image_size = 224
     labels = ["Neutral", "Happy", "Sad", "Surprise", "Fear", "Disgust", "Anger"]
@@ -195,14 +195,17 @@ def train():
     lambda_wav_hi = 0.5
     lambda_dan_expr = 1.6
     lambda_id = 0.8
-    lambda_lpips = 0.5
-    lambda_cycle = 1.0  # Cycle consistency reconstruction loss
+    lambda_lpips = 0.3
+    lambda_cycle = 0.4  # Cycle consistency reconstruction loss
 
 
     # Directories
-    log_dir = "/mnt/ias-data/tam/data/WaveletDiffusion/runs/exp"
-    model_path = "/mnt/ias-data/tam/data/WaveletDiffusion/model"
-    out_path = "/mnt/ias-data/tam/data/WaveletDiffusion/out"
+    log_dir = "/mnt/ias-data/tam/data/WaveletDiffusion_adagn_v1/runs/exp"
+    model_path = "/mnt/ias-data/tam/data/WaveletDiffusion_adagn_v1/model"
+    out_path = "/mnt/ias-data/tam/data/WaveletDiffusion_adagn_v1/out"
+    # log_dir = "WaveletDiffusionV8/runs/exp"
+    # model_path = "WaveletDiffusionV8/model"
+    # out_path = "WaveletDiffusionV8/out"
 
     for dir_path in [log_dir, model_path, out_path]:
         if dir_path == model_path:
@@ -216,11 +219,11 @@ def train():
     writer = SummaryWriter(log_dir)
     best_loss = float('inf')
 
-    # Data transforms
+    # Data transforms - use standard normalization to [-1, 1]
     transform = Compose([
         Resize((image_size, image_size)),
         ToTensor(),
-        Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])  # Maps [0,1] to [-1,1]
     ])
 
     # Datasets
@@ -398,11 +401,11 @@ def train():
                 pred_x0_img = iwt(pred_x0_wavelet)
                 pred_x0_img = torch.clamp(pred_x0_img, -1, 1)
 
-                # Normalize to [0,1] and resize for DAN
+                # Denormalize from [-1,1] to [0,1]
                 pred_x0_norm = (pred_x0_img + 1) / 2
                 dan_input = F.interpolate(pred_x0_norm, size=(224, 224), mode='bilinear')
 
-                # ImageNet normalization for DAN
+                # Apply ImageNet normalization for DAN
                 mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(dan_input.device)
                 std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(dan_input.device)
                 dan_input = (dan_input - mean) / std
@@ -411,7 +414,7 @@ def train():
                 dan_out, _, _ = emotion_model.model(dan_input)
 
                 # Time-based weighting: only apply DAN loss for low noise timesteps
-                t_thresh = int(0.3 * base_model.num_timesteps)  # Only for t < 30% of total timesteps
+                t_thresh = int(0.5 * base_model.num_timesteps)  # Only for t < 50% of total timesteps
                 time_weights = (t < t_thresh).float()  # (B,)
 
                 # Calculate per-sample loss and apply time weighting
@@ -433,8 +436,8 @@ def train():
                 if i % 30 == 0:
                     # ic(dan_predictions, expr_trg, expr_org)
                     with torch.no_grad():
-                        # Sử dụng denoising strength rất cao để ép model học thay đổi cảm xúc mạnh
-                        generated_img = base_model.sample(img_real, expr_trg, num_steps=75, denoising_strength=0.2)
+                        # Use higher denoising strength for better emotion transfer
+                        generated_img = base_model.sample(img_real, expr_trg, num_steps=100, denoising_strength=0.4)
 
                     # Use PerceptualWaveletLoss instead of manual wavelet loss calculation
                     wav_loss = perceptual_wavelet_loss(
@@ -464,7 +467,7 @@ def train():
 
                     lpips_loss = lpips_loss_fn(img_real, generated_img).mean()
                     with torch.no_grad():
-                        reconstructed_img = base_model.sample(generated_img, expr_org, num_steps=75, denoising_strength=0.2)
+                        reconstructed_img = base_model.sample(generated_img, expr_org, num_steps=100, denoising_strength=0.4)
                     cycle_loss = F.l1_loss(reconstructed_img, img_real)
 
                     # ===== TOTAL LOSS (with adaptive weights) =====
@@ -552,7 +555,7 @@ def train():
                                 writer.add_histogram("FiLM/Gamma_Distribution", all_gammas, step)
                                 writer.add_histogram("FiLM/Beta_Distribution", all_betas, step)
 
-                if i % 800 == 0:
+                if i % 1000 == 0 and i != 0:
                     save_checkpoint(model_path, epoch, i, base_model, optimizer, total_loss)
                     print("Generating validation images...")
                     model.eval()
@@ -583,8 +586,8 @@ def train():
                                 generated, cond_params = base_model.sample(
                                     sample,
                                     emotion_tensor,
-                                    num_steps=75,
-                                    denoising_strength=0.1,
+                                    num_steps=100,
+                                    denoising_strength=0.4,
                                     return_film_params=True
                                 )
 

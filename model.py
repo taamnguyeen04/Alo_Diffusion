@@ -461,7 +461,7 @@ class WaveletUNet(nn.Module):
             if src_image is not None:
                 res_feat = self.res_blocks[i](src_image)
                 # x = self.debug_res_conn(x, res_feat, i)
-                x = x + 0.05 * res_feat
+                x = x + 0.01 * res_feat  # Reduced from 0.05 to 0.01 for stability
                 # if i == 2 and self.training_step % 50 == 0:
                 #     stats = self.debugger.visualize_features(x, res_feat, i)
                 #     if stats['res_std'] > 100:
@@ -628,8 +628,10 @@ class WaveletDiffusionModel(nn.Module):
             alpha_prev = self.alphas_cumprod[timesteps[i+1].item()] if i < len(timesteps) - 1 else torch.tensor(1.0, device=device)
             alpha_t = alpha_t.to(device)
             alpha_prev = alpha_prev.to(device)
+            
             pred_x0 = (x - torch.sqrt(1 - alpha_t) * noise_pred) / torch.sqrt(alpha_t)
-            pred_x0 = torch.clamp(pred_x0, -3, 3)
+            # Softer clipping with tanh for smoother gradients
+            pred_x0 = torch.tanh(pred_x0 / 3.0) * 5.0  # Maps large values smoothly to [-5, 5]
 
             if i < len(timesteps) - 1:
                 x = torch.sqrt(alpha_prev) * pred_x0 + torch.sqrt(1 - alpha_prev) * noise_pred

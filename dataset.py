@@ -13,6 +13,7 @@ import time
 class Affectnet(Dataset):
     def __init__(self, is_train, transform=None, root=None):
         root = "C:/Users/tam/Desktop/Data/FEG"
+        # root = "/mnt/affectnet"
         image_path = os.path.join(root, "Manually_Annotated_Images")
         self.transform = transform
 
