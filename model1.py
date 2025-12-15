@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 
+
 class DWT(nn.Module):
     """Biến đổi wavelet rời rạc, phân tách ảnh thành 4 thành phần tần số"""
     def __init__(self):
@@ -460,7 +461,7 @@ class WaveletUNet(nn.Module):
             if src_image is not None:
                 res_feat = self.res_blocks[i](src_image)
                 # x = self.debug_res_conn(x, res_feat, i)
-                x = x + 0.05 * res_feat
+                x = x + 0.01 * res_feat  # Reduced from 0.05 to 0.01 for stability
                 # if i == 2 and self.training_step % 50 == 0:
                 #     stats = self.debugger.visualize_features(x, res_feat, i)
                 #     if stats['res_std'] > 100:
@@ -627,8 +628,10 @@ class WaveletDiffusionModel(nn.Module):
             alpha_prev = self.alphas_cumprod[timesteps[i+1].item()] if i < len(timesteps) - 1 else torch.tensor(1.0, device=device)
             alpha_t = alpha_t.to(device)
             alpha_prev = alpha_prev.to(device)
+            
             pred_x0 = (x - torch.sqrt(1 - alpha_t) * noise_pred) / torch.sqrt(alpha_t)
-            pred_x0 = torch.clamp(pred_x0, -3, 3)
+            # Softer clipping with tanh for smoother gradients
+            pred_x0 = torch.tanh(pred_x0 / 3.0) * 5.0  # Maps large values smoothly to [-5, 5]
 
             if i < len(timesteps) - 1:
                 x = torch.sqrt(alpha_prev) * pred_x0 + torch.sqrt(1 - alpha_prev) * noise_pred
@@ -687,4 +690,99 @@ class WaveletDiffusionModel(nn.Module):
         return result
 
 if __name__ == "__main__":
-    pass
+    # Khởi tạo mô hình
+    model = WaveletDiffusionModel(
+        num_emotions=8,
+        num_timesteps=1000,
+        use_film=True,
+        use_adagn=False
+    )
+
+    # Đếm tổng số tham số
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+    print("=" * 60)
+    print("Wavelet Diffusion Model - Thống kê tham số")
+    print("=" * 60)
+    print(f"Tổng số tham số:        {total_params:,}")
+    print(f"Tham số huấn luyện:     {trainable_params:,}")
+    print(f"Tham số frozen:         {total_params - trainable_params:,}")
+    print(f"Kích thước (MB):        {total_params * 4 / (1024**2):.2f}")
+    print("=" * 60)
+
+    # Đếm chi tiết theo từng thành phần
+    print("\nChi tiết theo thành phần:")
+    print("-" * 60)
+
+    # UNet components
+    unet_params = sum(p.numel() for p in model.unet.parameters())
+    print(f"UNet tổng:              {unet_params:,}")
+
+    # Encoder
+    encoder_params = sum(p.numel() for block_list in model.unet.encoder_blocks
+                        for block in block_list
+                        for p in block.parameters())
+    encoder_params += sum(p.numel() for block in model.unet.downsample_blocks
+                         for p in block.parameters())
+    print(f"  - Encoder:            {encoder_params:,}")
+
+    # Bottleneck
+    bottleneck_params = sum(p.numel() for block in model.unet.bottleneck
+                           for p in block.parameters())
+    print(f"  - Bottleneck:         {bottleneck_params:,}")
+
+    # Decoder
+    decoder_params = sum(p.numel() for block_list in model.unet.decoder_blocks
+                        for block in block_list
+                        for p in block.parameters())
+    decoder_params += sum(p.numel() for block in model.unet.upsample_blocks
+                         for p in block.parameters())
+    print(f"  - Decoder:            {decoder_params:,}")
+
+    # Embeddings
+    time_emb_params = sum(p.numel() for p in model.unet.time_embedding.parameters())
+    emotion_emb_params = sum(p.numel() for p in model.unet.emotion_embedding.parameters())
+    print(f"  - Time embedding:     {time_emb_params:,}")
+    print(f"  - Emotion embedding:  {emotion_emb_params:,}")
+
+    # Input/Output conv
+    input_conv_params = sum(p.numel() for p in model.unet.input_conv.parameters())
+    output_conv_params = sum(p.numel() for p in model.unet.output_conv.parameters())
+    print(f"  - Input conv:         {input_conv_params:,}")
+    print(f"  - Output conv:        {output_conv_params:,}")
+
+    # Residual connections
+    res_params = sum(p.numel() for block in model.unet.res_blocks
+                    for p in block.parameters())
+    print(f"  - Residual conn:      {res_params:,}")
+
+    print("=" * 60)
+
+    # Test forward pass
+    print("\nTest forward pass:")
+    print("-" * 60)
+    batch_size = 2
+    img_size = 256
+
+    x = torch.randn(batch_size, 3, img_size, img_size)
+    emotion_id = torch.randint(0, 8, (batch_size,))
+
+    print(f"Input shape:            {x.shape}")
+    print(f"Emotion IDs:            {emotion_id.tolist()}")
+
+    # Training forward
+    model.train()
+    loss = model(x, emotion_id, src_image=x)
+    print(f"Training loss:          {loss.item():.6f}")
+
+    # Inference forward
+    model.eval()
+    with torch.no_grad():
+        output = model.sample(x, emotion_id, num_steps=10, denoising_strength=0.2)
+    print(f"Output shape:           {output.shape}")
+    print(f"Output range:           [{output.min().item():.3f}, {output.max().item():.3f}]")
+
+    print("=" * 60)
+    print("✓ Mô hình hoạt động bình thường!")
+    print("=" * 60)

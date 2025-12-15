@@ -3,7 +3,7 @@ import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import multiprocessing
 from datetime import datetime
-
+# scp "WaveletDiffusion_film04\runs\exp\events.out.tfevents.1763323544.modal.272.0" root@159.89.193.7:/root/tb_logs/run_5/
 # ==============================
 # Cấu hình 1337  modal volume put affectnet "C:\Users\tam\Documents\GitHub\Alo_Diffusion\affecnet7_epoch6_acc0.6569.pth" /
 # ==============================
@@ -56,3 +56,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+

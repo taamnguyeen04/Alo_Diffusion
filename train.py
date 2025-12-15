@@ -119,8 +119,8 @@ def save_checkpoint(filepath, epoch, step, model, optimizer, loss):
 
 
 def load_checkpoint(filepath, model, optimizer, best_loss, device):
-    last_path = os.path.join(filepath, "last_model.pt")
-    best_path = os.path.join(filepath, "best_model.pt")
+    last_path = os.path.join("WaveletDiffusion_film04/WaveletDiffusion_film04/model", "best_model.pt")
+    best_path = os.path.join("WaveletDiffusion_film04/WaveletDiffusion_film04/model", "best_model.pt")
 
     start_epoch = 0
     loaded = False
@@ -174,14 +174,13 @@ def train():
     print(f"Number of GPUs available: {num_gpus}")
 
     # Hyperparameters - Reduced batch size for memory
-    batch_size = 16
-    lr = 5e-5
+    batch_size = 128
+    lr = 1e-5
     num_epochs = 5
     image_size = 224
     labels = ["Neutral", "Happy", "Sad", "Surprise", "Fear", "Disgust", "Anger"]
 
     # Emotion conditioning method toggle
-    # Note: Only one can be True at a time (FiLM or AdaGN)
     use_film = True  # FiLM: Feature-wise Linear Modulation
     use_adagn = False   # AdaGN: Adaptive Group Normalization
 
@@ -195,18 +194,12 @@ def train():
     lambda_wav_ll = 0.6
     lambda_wav_hi = 0.5
     lambda_dan_expr = 1.6
-    lambda_id = 0.8
-    lambda_lpips = 0.3
-    lambda_cycle = 0.4  # Cycle consistency reconstruction loss
 
 
     # Directories
-    log_dir = "/mnt/ias-data/tam/data/WaveletDiffusion_adagn_v1/runs/exp"
-    model_path = "/mnt/ias-data/tam/data/WaveletDiffusion_adagn_v1/model"
-    out_path = "/mnt/ias-data/tam/data/WaveletDiffusion_adagn_v1/out"
-    # log_dir = "WaveletDiffusionV8/runs/exp"
-    # model_path = "WaveletDiffusionV8/model"
-    # out_path = "WaveletDiffusionV8/out"
+    log_dir = "WaveletDiffusion_emotion/runs/exp"
+    model_path = "WaveletDiffusion_emotion/model"
+    out_path = "WaveletDiffusion_emotion/out"
 
     for dir_path in [log_dir, model_path, out_path]:
         if dir_path == model_path:
@@ -214,17 +207,18 @@ def train():
             continue
 
         if os.path.exists(dir_path):
-            shutil.rmtree(dir_path)
+            # shutil.rmtree(dir_path)
+            pass
         os.makedirs(dir_path, exist_ok=True)
 
     writer = SummaryWriter(log_dir)
     best_loss = float('inf')
 
-    # Data transforms - use standard normalization to [-1, 1]
+    # Data transforms
     transform = Compose([
         Resize((image_size, image_size)),
         ToTensor(),
-        Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])  # Maps [0,1] to [-1,1]
+        Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
 
     # Datasets
@@ -267,20 +261,8 @@ def train():
     for param in emotion_model.model.parameters():
         param.requires_grad = False
 
-    import torchvision.models as models
-    resnet50 = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1).to(device)
-    resnet50.eval()
-    for param in resnet50.parameters():
-        param.requires_grad = False
-    try:
-        lpips_loss_fn = lpips.LPIPS(net='vgg', pretrained=True).to(device)
-    except:
-        lpips_loss_fn = lpips.LPIPS(net='vgg').to(device)
-    for param in lpips_loss_fn.parameters():
-        param.requires_grad = False
 
     initial_weights = {
-        'lambda_id': lambda_id,
         'lambda_dan_expr': lambda_dan_expr
     }
     loss_weighter = AdaptiveLossWeighter(initial_weights, warmup_steps=5000)
@@ -301,42 +283,6 @@ def train():
     rmse = math.sqrt(mse)
     psnr = 20 * math.log10(2.0 / (rmse + 1e-12))  # dynamic range 2 for [-1,1]
     print('MSE', mse, 'PSNR', psnr)
-
-    # # SSIM per image (với batch x và x_rec dạng torch tensor)
-    # x_np = x.cpu().numpy().transpose(0, 2, 3, 1)  # (B, H, W, C)
-    # xrec_np = x_rec.cpu().numpy().transpose(0, 2, 3, 1)
-    #
-    # for i in range(x_np.shape[0]):
-    #     # Chuyển ảnh về [0,1] và cắt biên an toàn
-    #     img1 = np.clip((x_np[i] + 1) / 2, 0, 1)
-    #     img2 = np.clip((xrec_np[i] + 1) / 2, 0, 1)
-    #
-    #     # Xác định kích thước cửa sổ hợp lệ
-    #     win_size = min(7, img1.shape[0], img1.shape[1])
-    #     if win_size % 2 == 0:
-    #         win_size -= 1
-    #     win_size = max(win_size, 3)  # luôn >=3 và lẻ
-    #
-    #     try:
-    #         # Dùng channel_axis=-1 (chuẩn cho scikit-image >= 0.19)
-    #         s = ssim(img1, img2, channel_axis=-1, win_size=win_size, data_range=1.0)
-    #     except TypeError:
-    #         # fallback cho bản cũ (<0.19) vẫn còn multichannel
-    #         s = ssim(img1, img2, multichannel=True, win_size=win_size, data_range=1.0)
-    #
-    #     print(f"SSIM image {i}: {s:.6f}")
-    #
-    # s = ssim(img1, img2, channel_axis=-1, win_size=win_size, data_range=1.0)
-    # print("SSIM image", i, s)
-    #
-    # plt.subplot(1, 2, 1)
-    # plt.imshow((x_np[2] + 1) / 2)
-    # plt.title("Original")
-    #
-    # plt.subplot(1, 2, 2)
-    # plt.imshow((xrec_np[2] + 1) / 2)
-    # plt.title("Reconstructed")
-    # plt.show()
 
     # Optimizer with separate learning rates for AdaGN parameters
     # AdaGN (emotion_modulation) learns slower to prevent artifacts from abrupt changes
@@ -363,16 +309,6 @@ def train():
     # When using DataParallel, need to load to module (reuse base_model variable)
     start_epoch, best_loss = load_checkpoint(model_path, base_model, optimizer, best_loss, device)
 
-    # Initialize Loss Conflict Analyzer
-    print("Initializing Loss Conflict Analyzer...")
-    conflict_analyzer = LossConflictAnalyzer(
-        loss_names=['ddpm', 'dan_expr', 'wav', 'id', 'lpips', 'cycle'],
-        model=base_model,
-        log_freq=100,  # Analyze every 100 iterations
-        buffer_size=500,
-        save_dir=os.path.join(log_dir, 'conflict_analysis')
-    )
-
     # Fixed validation samples
     x_fixed, expr_fixed, _, _ = next(iter(val_dataloader))
     x_fixed = x_fixed.to(device)
@@ -390,14 +326,11 @@ def train():
                 img_real = img_real.to(device)
                 expr_org = expr_org.to(device)
 
-                rand_idx = torch.randperm(expr_org.size(0))
-                expr_trg = expr_org[rand_idx]
-
                 # ===== FORWARD PASS =====
                 x_wavelet = dwt(img_real)
                 t = torch.randint(0, base_model.num_timesteps, (img_real.shape[0],), device=device)
                 x_noisy, noise = base_model.forward_process(x_wavelet, t)
-                noise_pred = base_model.unet(x_noisy, t, expr_trg, img_real)
+                noise_pred = base_model.unet(x_noisy, t, expr_org, img_real)
                 ddpm_loss = F.l1_loss(noise_pred, noise)
 
                 # Calculate DAN loss directly from pred_x0 (differentiable) with time-based weighting
@@ -412,11 +345,11 @@ def train():
                 pred_x0_img = iwt(pred_x0_wavelet)
                 pred_x0_img = torch.clamp(pred_x0_img, -1, 1)
 
-                # Denormalize from [-1,1] to [0,1]
+                # Normalize to [0,1] and resize for DAN
                 pred_x0_norm = (pred_x0_img + 1) / 2
                 dan_input = F.interpolate(pred_x0_norm, size=(224, 224), mode='bilinear')
 
-                # Apply ImageNet normalization for DAN
+                # ImageNet normalization for DAN
                 mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(dan_input.device)
                 std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(dan_input.device)
                 dan_input = (dan_input - mean) / std
@@ -425,11 +358,11 @@ def train():
                 dan_out, _, _ = emotion_model.model(dan_input)
 
                 # Time-based weighting: only apply DAN loss for low noise timesteps
-                t_thresh = int(0.5 * base_model.num_timesteps)  # Only for t < 50% of total timesteps
+                t_thresh = int(0.3 * base_model.num_timesteps)  # Only for t < 30% of total timesteps
                 time_weights = (t < t_thresh).float()  # (B,)
 
                 # Calculate per-sample loss and apply time weighting
-                per_sample_dan_loss = F.cross_entropy(dan_out, expr_trg, reduction='none')  # (B,)
+                per_sample_dan_loss = F.cross_entropy(dan_out, expr_org, reduction='none')  # (B,)
                 dan_expr_loss = (per_sample_dan_loss * time_weights).sum() / (time_weights.sum().clamp_min(1.0))
 
                 # If no valid timesteps, set loss to 0
@@ -441,84 +374,34 @@ def train():
                     'ddpm': ddpm_loss
                 }
                 weight_updates = loss_weighter.update_weights(current_losses)
-                current_lambda_id = weight_updates.get('lambda_id', lambda_id)
                 current_lambda_dan_expr = weight_updates.get('lambda_dan_expr', lambda_dan_expr)
 
                 if i % 30 == 0:
-                    # ic(dan_predictions, expr_trg, expr_org)
+                    # ic(dan_predictions, expr_org, expr_org)
                     with torch.no_grad():
-                        # Use higher denoising strength for better emotion transfer
-                        generated_img = base_model.sample(img_real, expr_trg, num_steps=100, denoising_strength=0.4)
+                        # Sử dụng denoising strength rất cao để ép model học thay đổi cảm xúc mạnh
+                        generated_img = base_model.sample(img_real, expr_org, num_steps=100, denoising_strength=0.4)
 
                     # Use PerceptualWaveletLoss instead of manual wavelet loss calculation
                     wav_loss = perceptual_wavelet_loss(
                         generated_img,
                         img_real,
-                        lambda_ll=0.3,  # Weight for perceptual loss on LL band
-                        lambda_hi=1.0   # Weight for L1 loss on HF bands
+                        lambda_ll=lambda_wav_ll,  # Weight for perceptual loss on LL band
+                        lambda_hi=lambda_wav_hi   # Weight for L1 loss on HF bands
                     )
-
-                    real_norm = (img_real + 1) / 2  # [-1,1] -> [0,1]
-                    gen_norm = (generated_img + 1) / 2
-
-                    real_resized = F.interpolate(real_norm, size=(224, 224), mode='bilinear')
-                    gen_resized = F.interpolate(gen_norm, size=(224, 224), mode='bilinear')
-
-                    # ImageNet normalization
-                    mean_resnet = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(device)
-                    std_resnet = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(device)
-                    real_resized = (real_resized - mean_resnet) / std_resnet
-                    gen_resized = (gen_resized - mean_resnet) / std_resnet
-
-                    with torch.no_grad():
-                        real_features = resnet50(real_resized)
-                        gen_features = resnet50(gen_resized)
-
-                    id_loss = 1 - F.cosine_similarity(real_features, gen_features).mean()
-
-                    lpips_loss = lpips_loss_fn(img_real, generated_img).mean()
-                    with torch.no_grad():
-                        reconstructed_img = base_model.sample(generated_img, expr_org, num_steps=100, denoising_strength=0.4)
-                    cycle_loss = F.l1_loss(reconstructed_img, img_real)
 
                     # ===== TOTAL LOSS (with adaptive weights) =====
                     total_loss = (
                             lambda_ddpm * ddpm_loss +
                             current_lambda_dan_expr * dan_expr_loss +
-                            wav_loss +
-                            current_lambda_id * id_loss +
-                            lambda_lpips * lpips_loss +                             
-                            lambda_cycle * cycle_loss
+                            wav_loss
                     )
-                    
-                    # Analyze loss conflicts
-                    conflict_analyzer.analyze_step({
-                        'ddpm': ddpm_loss,
-                        'dan_expr': dan_expr_loss,
-                        'wav': wav_loss,
-                        'id': id_loss,
-                        'lpips': lpips_loss,
-                        'cycle': cycle_loss
-                    }, writer=writer)
                 else:
                     total_loss = (
                             lambda_ddpm * ddpm_loss +
                             current_lambda_dan_expr * dan_expr_loss
                     )
                     wav_loss = torch.tensor(0.0, device=device)
-                    id_loss = torch.tensor(0.0, device=device)
-                    lpips_loss = torch.tensor(0.0, device=device)
-                    cycle_loss = torch.tensor(0.0, device=device)
-                    
-                    # Still track ddpm and dan_expr losses
-                    conflict_analyzer.analyze_step({
-                        'ddpm': ddpm_loss,
-                        'dan_expr': dan_expr_loss,
-                        'wav': wav_loss,
-                        'id': id_loss,
-                        'lpips': lpips_loss,
-                        'cycle': cycle_loss
-                    }, writer=writer)
 
                 # ===== BACKWARD PASS =====
                 optimizer.zero_grad()
@@ -531,9 +414,7 @@ def train():
                     "Total": f"{total_loss.item():.4f}",
                     "DDPM": f"{ddpm_loss.item():.4f}",
                     "DAN_Expr": f"{dan_expr_loss.item():.4f}",
-                    "Wav": f"{wav_loss.item():.4f}",
-                    "ID": f"{id_loss.item():.4f}",
-                    "Cycle": f"{cycle_loss.item():.4f}"
+                    "Wav": f"{wav_loss.item():.4f}"
                 })
 
                 # TensorBoard logging
@@ -543,15 +424,12 @@ def train():
                     writer.add_scalar("Loss/DDPM", ddpm_loss.item(), step)
                     writer.add_scalar("Loss/DAN_Expression", dan_expr_loss.item(), step)
                     writer.add_scalar("Loss/Wavelet", wav_loss.item(), step)
-                    writer.add_scalar("Loss/Identity", id_loss.item(), step)
-                    writer.add_scalar("Loss/LPIPS", lpips_loss.item(), step)
-                    writer.add_scalar("Loss/Cycle_Consistency", cycle_loss.item(), step)
 
                     # Log FiLM parameters statistics during training
                     with torch.no_grad():
                         # Get a single sample to check FiLM params
                         sample_img = img_real[:1]
-                        sample_emotion = expr_trg[:1]
+                        sample_emotion = expr_org[:1]
                         _, sample_film_params = base_model.sample(
                             sample_img,
                             sample_emotion,
@@ -587,7 +465,7 @@ def train():
                                 writer.add_histogram("FiLM/Gamma_Distribution", all_gammas, step)
                                 writer.add_histogram("FiLM/Beta_Distribution", all_betas, step)
 
-                if i % 1000 == 0 and i != 0:
+                if i % 800 == 0:
                     save_checkpoint(model_path, epoch, i, base_model, optimizer, total_loss)
                     print("Generating validation images...")
                     model.eval()
@@ -602,7 +480,7 @@ def train():
 
                         # Generate images with conditioning parameters
                         pil_images = []
-
+                        tensor_images = []
                         # Process each sample separately to get individual params
                         for sample_idx in range(min(4, x_fixed.shape[0])):
                             sample = x_fixed[sample_idx:sample_idx+1]
@@ -611,6 +489,7 @@ def train():
                             orig_img_tensor = (sample[0].clamp(-1, 1) + 1) / 2  # [0,1]
                             orig_pil = add_film_params_to_image(orig_img_tensor, None, "Original", cond_type)
                             pil_images.append(orig_pil)
+                            tensor_images.append(orig_img_tensor)
 
                             # Generate for each emotion
                             for emotion_id in range(len(labels)):
@@ -618,7 +497,7 @@ def train():
                                 generated, cond_params = base_model.sample(
                                     sample,
                                     emotion_tensor,
-                                    num_steps=100,
+                                    num_steps=250,
                                     denoising_strength=0.4,
                                     return_film_params=True
                                 )
@@ -631,6 +510,7 @@ def train():
                                     cond_type
                                 )
                                 pil_images.append(gen_pil)
+                                tensor_images.append(gen_img_tensor)
 
                         # Create grid from PIL images
                         if pil_images:
@@ -653,6 +533,25 @@ def train():
 
                             grid_img.save(f"{out_path}/epoch{epoch}_iter{i}_emotions_film.png")
                             print(f"Saved validation images with FiLM params: {out_path}/epoch{epoch}_iter{i}_emotions_film.png")
+                        
+                        if tensor_images:
+                            all_imgs = torch.stack(tensor_images, dim=0)
+                            all_imgs_grid = all_imgs.reshape(n_samples, n_emotions, *all_imgs.shape[1:])
+                            writer.add_images(
+                                "Validation/All_Emotions_Grid", 
+                                all_imgs_grid.flatten(0, 1), 
+                                step, 
+                                dataformats='NCHW'
+                            )
+                            
+                            for emo_idx, emo_name in enumerate(labels):
+                                emo_imgs = all_imgs_grid[:, emo_idx + 1]  # +1 to skip original
+                                writer.add_images(
+                                    f"Validation/Emotion_{emo_name}",
+                                    emo_imgs,
+                                    step,
+                                    dataformats='NCHW'
+                                )
 
                     model.train()
 
@@ -660,10 +559,6 @@ def train():
         print("Training interrupted by user")
         if 'total_loss' in locals():
             save_checkpoint(model_path, epoch, i, base_model, optimizer, total_loss)
-    finally:
-        # Save final conflict analysis report
-        print("\nGenerating final conflict analysis report...")
-        conflict_analyzer.save_final_report()
 
     print("Training completed!")
     writer.close()

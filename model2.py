@@ -3,36 +3,69 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 
+
 class DWT(nn.Module):
-    """Biến đổi wavelet rời rạc, phân tách ảnh thành 4 thành phần tần số"""
-    def __init__(self):
+    """Biến đổi wavelet rời rạc (DWT) + Chuẩn hoá đầu ra"""
+    def __init__(self, normalize=True, mean_std=None):
+        """
+        Args:
+            normalize (bool): Bật/tắt chuẩn hoá.
+            mean_std (dict or None): Nếu cung cấp, dùng giá trị mean/std cố định
+                {'LL': (mean, std), 'LH': (...), 'HL': (...), 'HH': (...)}.
+                Nếu None, sẽ chuẩn hoá theo batch động.
+        """
         super(DWT, self).__init__()
         self.low = torch.tensor([1., 1.]) / math.sqrt(2)
         self.high = torch.tensor([1., -1.]) / math.sqrt(2)
+        self.normalize = normalize
+        self.mean_std = {
+            'LL': (-0.191473, 1.083653),
+            'LH': (-0.000004, 0.069750),
+            'HL': (-0.000353, 0.062807),
+            'HH': (-0.000007, 0.022190),
+        }
 
     def forward(self, x):
         B, C, H, W = x.shape
         assert H % 2 == 0 and W % 2 == 0, "Height and Width must be even"
+
         low = self.low.to(x.device)
         high = self.high.to(x.device)
 
-        ll = torch.outer(low, low).unsqueeze(0).unsqueeze(0)  # (1, 1, 2, 2)
+        ll = torch.outer(low, low).unsqueeze(0).unsqueeze(0)
         lh = torch.outer(low, high).unsqueeze(0).unsqueeze(0)
         hl = torch.outer(high, low).unsqueeze(0).unsqueeze(0)
         hh = torch.outer(high, high).unsqueeze(0).unsqueeze(0)
 
-        ll = ll.repeat(C, 1, 1, 1)  # (C, 1, 2, 2)
+        ll = ll.repeat(C, 1, 1, 1)
         lh = lh.repeat(C, 1, 1, 1)
         hl = hl.repeat(C, 1, 1, 1)
         hh = hh.repeat(C, 1, 1, 1)
 
+        # Biến đổi
         x_ll = F.conv2d(x, ll, stride=2, groups=C)
         x_lh = F.conv2d(x, lh, stride=2, groups=C)
         x_hl = F.conv2d(x, hl, stride=2, groups=C)
         x_hh = F.conv2d(x, hh, stride=2, groups=C)
 
-        return torch.cat([x_ll, x_lh, x_hl, x_hh], dim=1)
+        # ====== 🔹 Bước CHUẨN HOÁ ======
+        if self.normalize:
+            if self.mean_std is not None:
+                # 🔸 Chuẩn hoá theo giá trị thống kê cố định (toàn dataset)
+                for i, (name, tensor) in enumerate(zip(
+                    ['LL', 'LH', 'HL', 'HH'],
+                    [x_ll, x_lh, x_hl, x_hh]
+                )):
+                    mean, std = self.mean_std[name]
+                    tensor.sub_(mean).div_(std + 1e-8)
+            else:
+                # 🔸 Chuẩn hoá động theo batch (z-score)
+                for tensor in [x_ll, x_lh, x_hl, x_hh]:
+                    mean = tensor.mean(dim=[1,2,3], keepdim=True)
+                    std = tensor.std(dim=[1,2,3], keepdim=True)
+                    tensor.sub_(mean).div_(std + 1e-8)
 
+        return torch.cat([x_ll, x_lh, x_hl, x_hh], dim=1)
 
 class IWT(nn.Module):
     """Phép biến đổi ngược của DWT để tái tạo ảnh từ các thành phần tần số"""
@@ -46,10 +79,10 @@ class IWT(nn.Module):
         assert C4 % 4 == 0, "Channel dimension must be divisible by 4"
         C = C4 // 4
 
-        x_ll = x[:, :C, :, :]
-        x_lh = x[:, C:2*C, :, :]
-        x_hl = x[:, 2*C:3*C, :, :]
-        x_hh = x[:, 3*C:, :, :]
+        x_ll = x[:, :C, :, :]*2
+        x_lh = x[:, C:2*C, :, :]*2
+        x_hl = x[:, 2*C:3*C, :, :]*2
+        x_hh = x[:, 3*C:, :, :]*2
 
         low = self.low.to(x.device)
         high = self.high.to(x.device)
@@ -255,6 +288,7 @@ class FrequencyBottleneckBlock(nn.Module):
 
         self.low_freq_processor = nn.Sequential(
             ResBlock(channels, channels, time_dim, emotion_dim, use_film=use_film, use_adagn=use_adagn),
+            ResBlock(channels, channels, time_dim, emotion_dim, use_film=use_film, use_adagn=use_adagn),
             ResBlock(channels, channels, time_dim, emotion_dim, use_film=use_film, use_adagn=use_adagn)
         )
 
@@ -355,7 +389,7 @@ class WaveletUNet(nn.Module):
     def __init__(self,
                  in_channels=12,
                  out_channels=12,
-                 features=[64, 128, 256, 512],
+                 features=[96, 192, 384, 768],
                  time_dim=256,
                  emotion_dim=64,
                  num_emotions=8,
@@ -369,18 +403,9 @@ class WaveletUNet(nn.Module):
         self.use_film = use_film
         self.use_adagn = use_adagn
 
-        # Use learnable embedding instead of one-hot + projection
         self.emotion_embedding = nn.Embedding(num_emotions, emotion_dim)
 
         self.input_conv = nn.Conv2d(in_channels, features[0], 3, padding=1)
-
-        # self.debug_res_conn = DebugResidualConnection(
-        #             save_dir='debug_artifacts',
-        #             debug_freq=100,
-        #             alpha=0.05
-        #         )
-        # self.debugger = ArtifactDebugger(save_dir='debug_special')
-        # self.training_step = 0
 
         self.encoder_blocks = nn.ModuleList()
         self.downsample_blocks = nn.ModuleList()
@@ -390,6 +415,7 @@ class WaveletUNet(nn.Module):
             use_attn = i >= len(features) // 2
 
             self.encoder_blocks.append(nn.ModuleList([
+                ResBlock(features[i], features[i], time_dim, emotion_dim, use_cross_attn=use_attn, use_film=use_film, use_adagn=use_adagn),
                 ResBlock(features[i], features[i], time_dim, emotion_dim, use_cross_attn=use_attn, use_film=use_film, use_adagn=use_adagn),
                 ResBlock(features[i], features[i], time_dim, emotion_dim, use_cross_attn=use_attn, use_film=use_film, use_adagn=use_adagn)
             ]))
@@ -418,6 +444,7 @@ class WaveletUNet(nn.Module):
 
             self.decoder_blocks.append(nn.ModuleList([
                 ResBlock(features[i-1] * 2, features[i-1], time_dim, emotion_dim, use_film=use_film, use_adagn=use_adagn),
+                ResBlock(features[i-1], features[i-1], time_dim, emotion_dim, use_film=use_film, use_adagn=use_adagn),
                 ResBlock(features[i-1], features[i-1], time_dim, emotion_dim, use_film=use_film, use_adagn=use_adagn)
             ]))
 
@@ -439,7 +466,6 @@ class WaveletUNet(nn.Module):
         """
         time_emb = self.time_embedding(t)
 
-        # Use embedding lookup instead of one-hot encoding
         emotion_emb = self.emotion_embedding(emotion_id)
 
         x = self.input_conv(x)
@@ -459,12 +485,7 @@ class WaveletUNet(nn.Module):
 
             if src_image is not None:
                 res_feat = self.res_blocks[i](src_image)
-                # x = self.debug_res_conn(x, res_feat, i)
-                x = x + 0.05 * res_feat
-                # if i == 2 and self.training_step % 50 == 0:
-                #     stats = self.debugger.visualize_features(x, res_feat, i)
-                #     if stats['res_std'] > 100:
-                #         print(f"⚠️ Block {i}: High std = {stats['res_std']:.2f}")
+                x = x + 0.01 * res_feat  # Reduced from 0.05 to 0.01 for stability
 
             skip_connections.append(x)
 
@@ -512,9 +533,7 @@ class WaveletDiffusionModel(nn.Module):
     """Mô hình diffusion hoàn chỉnh để chỉnh sửa cảm xúc."""
     def __init__(self,
                  num_emotions=8,
-                 num_timesteps=1000,
-                 beta_start=1e-4,
-                 beta_end=2e-2,
+                 num_timesteps=200,
                  use_emotion_smooth=True,
                  smooth_weight=0.1,
                  use_film=True,
@@ -528,28 +547,46 @@ class WaveletDiffusionModel(nn.Module):
         self.use_film = use_film
         self.use_adagn = use_adagn
 
+        # ====== Các thành phần chính ======
         self.dwt = DWT()
         self.iwt = IWT()
-
         self.unet = WaveletUNet(num_emotions=num_emotions, use_film=use_film, use_adagn=use_adagn)
 
-        # Register gradient hook on first conv layer
+        # ====== Hook theo dõi gradient (nếu cần debug) ======
         def grad_hook(module, grad_in, grad_out):
             if grad_out[0] is not None:
                 # print(f"UNet first conv grad mean: {grad_out[0].abs().mean().item():.6f}")
                 pass
-
         self.unet.input_conv.register_full_backward_hook(grad_hook)
 
-        betas = torch.linspace(beta_start, beta_end, num_timesteps)
+        # ============================================================
+        # 🔹 COSINE β-SCHEDULE (Improved DDPM)
+        # ============================================================
+        import math, torch
+
+        s = 0.008  # offset nhỏ để tránh alpha_bar = 0 ở cuối
+        steps = num_timesteps + 1
+        x = torch.linspace(0, num_timesteps, steps, dtype=torch.float32)
+
+        # ᾱ_t theo cosine (alpha_cumprod)
+        alphas_cumprod = torch.cos(((x / num_timesteps) + s) / (1 + s) * math.pi * 0.5) ** 2
+        alphas_cumprod = alphas_cumprod / alphas_cumprod[0]  # chuẩn hóa để ᾱ_0 = 1
+
+        # β_t suy ra từ ᾱ_t
+        betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
+        betas = betas.clamp(0.0001, 0.9999)
+
+        # α_t và tích lũy ᾱ_t
         alphas = 1.0 - betas
         alphas_cumprod = torch.cumprod(alphas, dim=0)
+
 
         self.register_buffer('betas', betas)
         self.register_buffer('alphas', alphas)
         self.register_buffer('alphas_cumprod', alphas_cumprod)
         self.register_buffer('sqrt_alphas_cumprod', torch.sqrt(alphas_cumprod))
         self.register_buffer('sqrt_one_minus_alphas_cumprod', torch.sqrt(1.0 - alphas_cumprod))
+        self.register_buffer("alphas_cumprod_prev", torch.cat([torch.tensor([1.0]), alphas_cumprod[:-1]]))
 
         # Emotion wheel distances (psychological similarity)
         # 0:neutral, 1:happy, 2:sad, 3:angry, 4:surprised, 5:fearful, 6:disgusted, 7:contempt
@@ -627,8 +664,10 @@ class WaveletDiffusionModel(nn.Module):
             alpha_prev = self.alphas_cumprod[timesteps[i+1].item()] if i < len(timesteps) - 1 else torch.tensor(1.0, device=device)
             alpha_t = alpha_t.to(device)
             alpha_prev = alpha_prev.to(device)
+            
             pred_x0 = (x - torch.sqrt(1 - alpha_t) * noise_pred) / torch.sqrt(alpha_t)
-            pred_x0 = torch.clamp(pred_x0, -3, 3)
+            # Softer clipping with tanh for smoother gradients
+            pred_x0 = torch.tanh(pred_x0 / 3.0) * 5.0  # Maps large values smoothly to [-5, 5]
 
             if i < len(timesteps) - 1:
                 x = torch.sqrt(alpha_prev) * pred_x0 + torch.sqrt(1 - alpha_prev) * noise_pred
@@ -687,4 +726,99 @@ class WaveletDiffusionModel(nn.Module):
         return result
 
 if __name__ == "__main__":
-    pass
+    # Khởi tạo mô hình
+    model = WaveletDiffusionModel(
+        num_emotions=8,
+        num_timesteps=1000,
+        use_film=True,
+        use_adagn=False
+    )
+
+    # Đếm tổng số tham số
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+    print("=" * 60)
+    print("Wavelet Diffusion Model - Thống kê tham số")
+    print("=" * 60)
+    print(f"Tổng số tham số:        {total_params:,}")
+    print(f"Tham số huấn luyện:     {trainable_params:,}")
+    print(f"Tham số frozen:         {total_params - trainable_params:,}")
+    print(f"Kích thước (MB):        {total_params * 4 / (1024**2):.2f}")
+    print("=" * 60)
+
+    # Đếm chi tiết theo từng thành phần
+    print("\nChi tiết theo thành phần:")
+    print("-" * 60)
+
+    # UNet components
+    unet_params = sum(p.numel() for p in model.unet.parameters())
+    print(f"UNet tổng:              {unet_params:,}")
+
+    # Encoder
+    encoder_params = sum(p.numel() for block_list in model.unet.encoder_blocks
+                        for block in block_list
+                        for p in block.parameters())
+    encoder_params += sum(p.numel() for block in model.unet.downsample_blocks
+                         for p in block.parameters())
+    print(f"  - Encoder:            {encoder_params:,}")
+
+    # Bottleneck
+    bottleneck_params = sum(p.numel() for block in model.unet.bottleneck
+                           for p in block.parameters())
+    print(f"  - Bottleneck:         {bottleneck_params:,}")
+
+    # Decoder
+    decoder_params = sum(p.numel() for block_list in model.unet.decoder_blocks
+                        for block in block_list
+                        for p in block.parameters())
+    decoder_params += sum(p.numel() for block in model.unet.upsample_blocks
+                         for p in block.parameters())
+    print(f"  - Decoder:            {decoder_params:,}")
+
+    # Embeddings
+    time_emb_params = sum(p.numel() for p in model.unet.time_embedding.parameters())
+    emotion_emb_params = sum(p.numel() for p in model.unet.emotion_embedding.parameters())
+    print(f"  - Time embedding:     {time_emb_params:,}")
+    print(f"  - Emotion embedding:  {emotion_emb_params:,}")
+
+    # Input/Output conv
+    input_conv_params = sum(p.numel() for p in model.unet.input_conv.parameters())
+    output_conv_params = sum(p.numel() for p in model.unet.output_conv.parameters())
+    print(f"  - Input conv:         {input_conv_params:,}")
+    print(f"  - Output conv:        {output_conv_params:,}")
+
+    # Residual connections
+    res_params = sum(p.numel() for block in model.unet.res_blocks
+                    for p in block.parameters())
+    print(f"  - Residual conn:      {res_params:,}")
+
+    print("=" * 60)
+
+    # Test forward pass
+    print("\nTest forward pass:")
+    print("-" * 60)
+    batch_size = 2
+    img_size = 256
+
+    x = torch.randn(batch_size, 3, img_size, img_size)
+    emotion_id = torch.randint(0, 8, (batch_size,))
+
+    print(f"Input shape:            {x.shape}")
+    print(f"Emotion IDs:            {emotion_id.tolist()}")
+
+    # Training forward
+    model.train()
+    loss = model(x, emotion_id, src_image=x)
+    print(f"Training loss:          {loss.item():.6f}")
+
+    # Inference forward
+    model.eval()
+    with torch.no_grad():
+        output = model.sample(x, emotion_id, num_steps=10, denoising_strength=0.2)
+    print(f"Output shape:           {output.shape}")
+    print(f"Output range:           [{output.min().item():.3f}, {output.max().item():.3f}]")
+
+    print("=" * 60)
+    print("✓ Mô hình hoạt động bình thường!")
+    print("=" * 60)
