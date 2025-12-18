@@ -190,16 +190,16 @@ def train():
     print(f"Using AdaGN conditioning: {use_adagn}")
 
     # Loss weights - sử dụng DAN emotion model
-    lambda_ddpm = 2.0
-    lambda_wav_ll = 0.6
-    lambda_wav_hi = 0.5
+    lambda_ddpm = 1.0
+    lambda_wav_ll = 10.0  # Strong constraint for structure/color (LL band)
+    lambda_wav_hi = 1.0   # Relaxed constraint for details (HF bands)
     lambda_dan_expr = 1.6
 
 
     # Directories
-    log_dir = "WaveletDiffusion_emotion/runs/exp"
-    model_path = "WaveletDiffusion_emotion/model"
-    out_path = "WaveletDiffusion_emotion/out"
+    log_dir = "WaveletDiffusion_star/runs/exp"
+    model_path = "WaveletDiffusion_star/model"
+    out_path = "WaveletDiffusion_star/out"
 
     for dir_path in [log_dir, model_path, out_path]:
         if dir_path == model_path:
@@ -330,7 +330,11 @@ def train():
                 x_wavelet = dwt(img_real)
                 t = torch.randint(0, base_model.num_timesteps, (img_real.shape[0],), device=device)
                 x_noisy, noise = base_model.forward_process(x_wavelet, t)
-                noise_pred = base_model.unet(x_noisy, t, expr_org, img_real)
+                
+                # StarGAN Injection: Add emotion channels to input
+                unet_input = base_model._inject_emotion(x_noisy, expr_org)
+                
+                noise_pred = base_model.unet(unet_input, t, expr_org, img_real)
                 ddpm_loss = F.l1_loss(noise_pred, noise)
 
                 # Calculate DAN loss directly from pred_x0 (differentiable) with time-based weighting
@@ -376,32 +380,27 @@ def train():
                 weight_updates = loss_weighter.update_weights(current_losses)
                 current_lambda_dan_expr = weight_updates.get('lambda_dan_expr', lambda_dan_expr)
 
-                if i % 30 == 0:
-                    # ic(dan_predictions, expr_org, expr_org)
-                    with torch.no_grad():
-                        # Sử dụng denoising strength rất cao để ép model học thay đổi cảm xúc mạnh
-                        generated_img = base_model.sample(img_real, expr_org, num_steps=100, denoising_strength=0.4)
+                # Calculate Wavelet Loss on predicted x0 (differentiable)
+                # We apply this every step to enforce structure/color consistency from the start
+                wav_loss = perceptual_wavelet_loss(
+                    pred_x0_img,
+                    img_real,
+                    lambda_ll=lambda_wav_ll,
+                    lambda_hi=lambda_wav_hi
+                )
 
-                    # Use PerceptualWaveletLoss instead of manual wavelet loss calculation
-                    wav_loss = perceptual_wavelet_loss(
-                        generated_img,
-                        img_real,
-                        lambda_ll=lambda_wav_ll,  # Weight for perceptual loss on LL band
-                        lambda_hi=lambda_wav_hi   # Weight for L1 loss on HF bands
-                    )
+                # Logging/Vis every 100 steps (moved from 30)
+                if i % 100 == 0:
+                     with torch.no_grad():
+                        # Just for visualization/debug, not loss
+                        pass
 
-                    # ===== TOTAL LOSS (with adaptive weights) =====
-                    total_loss = (
-                            lambda_ddpm * ddpm_loss +
-                            current_lambda_dan_expr * dan_expr_loss +
-                            wav_loss
-                    )
-                else:
-                    total_loss = (
-                            lambda_ddpm * ddpm_loss +
-                            current_lambda_dan_expr * dan_expr_loss
-                    )
-                    wav_loss = torch.tensor(0.0, device=device)
+                # ===== TOTAL LOSS (with adaptive weights) =====
+                total_loss = (
+                        lambda_ddpm * ddpm_loss +
+                        current_lambda_dan_expr * dan_expr_loss +
+                        wav_loss
+                )
 
                 # ===== BACKWARD PASS =====
                 optimizer.zero_grad()

@@ -372,6 +372,7 @@ class WaveletUNet(nn.Module):
         # Use learnable embedding instead of one-hot + projection
         self.emotion_embedding = nn.Embedding(num_emotions, emotion_dim)
 
+        # Input convolution: accepts (12 + num_emotions) channels if StarGAN injection is used
         self.input_conv = nn.Conv2d(in_channels, features[0], 3, padding=1)
 
         # self.debug_res_conn = DebugResidualConnection(
@@ -531,7 +532,13 @@ class WaveletDiffusionModel(nn.Module):
         self.dwt = DWT()
         self.iwt = IWT()
 
-        self.unet = WaveletUNet(num_emotions=num_emotions, use_film=use_film, use_adagn=use_adagn)
+        # StarGAN Injection: Input = 12 wavelet channels + num_emotions channels
+        # Total input channels = 12 + num_emotions
+        self.unet = WaveletUNet(in_channels=12 + num_emotions, 
+                                out_channels=12,
+                                num_emotions=num_emotions, 
+                                use_film=use_film, 
+                                use_adagn=use_adagn)
 
         # Register gradient hook on first conv layer
         def grad_hook(module, grad_in, grad_out):
@@ -556,6 +563,31 @@ class WaveletDiffusionModel(nn.Module):
         # Create distance matrix based on emotion wheel
         # self.register_buffer('emotion_distances', self._create_emotion_distance_matrix(num_emotions))
 
+    def _inject_emotion(self, x_wavelet, emotion_id):
+        """
+        Inject emotion vector into LL band of wavelet coefficients (StarGAN style).
+        Args:
+            x_wavelet: (B, 12, H, W)
+            emotion_id: (B,)
+        Returns:
+            x_in: (B, 12 + num_emotions, H, W)
+        """
+        B, C, H, W = x_wavelet.shape
+        device = x_wavelet.device
+
+        # Create one-hot emotion map
+        emotion_onehot = F.one_hot(emotion_id, num_classes=self.num_emotions).float() # (B, num_emotions)
+        emotion_map = emotion_onehot[:, :, None, None].expand(B, self.num_emotions, H, W)
+
+        # Split bands: LL is first 3 channels
+        ll = x_wavelet[:, :3, :, :]
+        others = x_wavelet[:, 3:, :, :]
+
+        # Concatenate: [LL, Emotion, Others]
+        # This matches: { [LL ⊕ c], LH, HL, HH }
+        x_in = torch.cat([ll, emotion_map, others], dim=1)
+        return x_in
+
     def forward_process(self, x0, t, noise=None):
         """thêm nhiễu vào wavelet ở bước t."""
         if noise is None:
@@ -571,7 +603,11 @@ class WaveletDiffusionModel(nn.Module):
         x_wavelet = self.dwt(x)  # (B, 12, H/2, W/2)
         t = torch.randint(0, self.num_timesteps, (x.shape[0],), device=x.device)
         x_noisy, noise = self.forward_process(x_wavelet, t)
-        noise_pred = self.unet(x_noisy, t, emotion_id, src_image)
+        
+        # StarGAN Injection
+        unet_input = self._inject_emotion(x_noisy, emotion_id)
+        
+        noise_pred = self.unet(unet_input, t, emotion_id, src_image)
         loss = F.l1_loss(noise_pred, noise)
         return loss
 
@@ -618,10 +654,14 @@ class WaveletDiffusionModel(nn.Module):
             t_tensor = torch.full((B,), t.item(), device=device, dtype=torch.long)
             # Get FiLM params only on the last step
             is_last = (i == len(timesteps) - 1)
+            
+            # StarGAN Injection
+            unet_input = self._inject_emotion(x, target_emotion_id)
+            
             if return_film_params and is_last:
-                noise_pred, film_params = self.unet(x, t_tensor, target_emotion_id, src_image, return_film_params=True)
+                noise_pred, film_params = self.unet(unet_input, t_tensor, target_emotion_id, src_image, return_film_params=True)
             else:
-                noise_pred = self.unet(x, t_tensor, target_emotion_id, src_image)
+                noise_pred = self.unet(unet_input, t_tensor, target_emotion_id, src_image)
 
             alpha_t = self.alphas_cumprod[t.item()]
             alpha_prev = self.alphas_cumprod[timesteps[i+1].item()] if i < len(timesteps) - 1 else torch.tensor(1.0, device=device)
@@ -668,7 +708,11 @@ class WaveletDiffusionModel(nn.Module):
         # Full timestep sampling
         for i, t in enumerate(timesteps):
             t_tensor = torch.full((B,), t.item(), device=device, dtype=torch.long)
-            noise_pred = self.unet(x, t_tensor, target_emotion_id, src_image)
+            
+            # StarGAN Injection
+            unet_input = self._inject_emotion(x, target_emotion_id)
+            
+            noise_pred = self.unet(unet_input, t_tensor, target_emotion_id, src_image)
 
             alpha_t = self.alphas_cumprod[t.item()]
             alpha_prev = self.alphas_cumprod[timesteps[i+1].item()] if i < len(timesteps) - 1 else torch.tensor(1.0, device=device)
