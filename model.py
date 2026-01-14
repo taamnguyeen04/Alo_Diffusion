@@ -13,8 +13,8 @@ class DWT(nn.Module):
     def forward(self, x):
         B, C, H, W = x.shape
         assert H % 2 == 0 and W % 2 == 0, "Height and Width must be even"
-        low = self.low.to(x.device)
-        high = self.high.to(x.device)
+        low = self.low.to(x.device).type(x.dtype)
+        high = self.high.to(x.device).type(x.dtype)
 
         ll = torch.outer(low, low).unsqueeze(0).unsqueeze(0)  # (1, 1, 2, 2)
         lh = torch.outer(low, high).unsqueeze(0).unsqueeze(0)
@@ -51,8 +51,8 @@ class IWT(nn.Module):
         x_hl = x[:, 2*C:3*C, :, :]
         x_hh = x[:, 3*C:, :, :]
 
-        low = self.low.to(x.device)
-        high = self.high.to(x.device)
+        low = self.low.to(x.device).type(x.dtype)
+        high = self.high.to(x.device).type(x.dtype)
 
         ll = torch.outer(low, low).unsqueeze(0).unsqueeze(0) # (1, 1, 2, 2)
         lh = torch.outer(low, high).unsqueeze(0).unsqueeze(0)
@@ -438,7 +438,7 @@ class WaveletUNet(nn.Module):
             return_aux: Whether to return auxiliary predictions
             return_film_params: Whether to return FiLM gamma/beta parameters
         """
-        time_emb = self.time_embedding(t)
+        time_emb = self.time_embedding(t).to(dtype=x.dtype)
 
         # Use embedding lookup instead of one-hot encoding
         emotion_emb = self.emotion_embedding(emotion_id)
@@ -576,7 +576,7 @@ class WaveletDiffusionModel(nn.Module):
         device = x_wavelet.device
 
         # Create one-hot emotion map
-        emotion_onehot = F.one_hot(emotion_id, num_classes=self.num_emotions).float() # (B, num_emotions)
+        emotion_onehot = F.one_hot(emotion_id, num_classes=self.num_emotions).to(dtype=x_wavelet.dtype) # (B, num_emotions)
         emotion_map = emotion_onehot[:, :, None, None].expand(B, self.num_emotions, H, W)
 
         # Split bands: LL is first 3 channels

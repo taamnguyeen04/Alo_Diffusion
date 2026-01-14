@@ -9,3 +9,6 @@
 /WaveletDiffusion5
 affecnet7_epoch6_acc0.6569.pth
 /venv
+/WaveletDiffusion_phase1
+__pycache__
+.idea
