@@ -11,6 +11,7 @@ from torchvision import models
 from torchvision.models import resnet50
 from dataset import Affectnet
 from torch.utils.data import Dataset, DataLoader
+from model_dtcwt_v2 import DWT
 
 class PerceptualWaveletLoss(nn.Module):
     """Perceptual loss for wavelet domain with separate handling of LL and HF bands"""
@@ -37,7 +38,7 @@ class PerceptualWaveletLoss(nn.Module):
             lambda_ll: Weight for perceptual loss on LL band
             lambda_hi: Weight for L1 loss on HF bands
         """
-        from model import DWT
+        
         dwt = DWT().to(generated.device)
         
         # Get wavelet decomposition
@@ -83,6 +84,241 @@ class PerceptualWaveletLoss(nn.Module):
         total_loss = lambda_ll * perceptual_loss + lambda_hi * hi_loss
         
         return total_loss
+
+
+class PerceptualWaveletLoss_DTCWT(nn.Module):
+    """
+    Perceptual loss for DTCWT domain with 6-orientation HF bands.
+    
+    DTCWT provides:
+    - LL band (3 channels): Structure/color - use VGG perceptual loss
+    - HF_real (18 channels): 6 orientations × 3 RGB - real part
+    - HF_imag (18 channels): 6 orientations × 3 RGB - imaginary part
+    
+    Total: 39 channels for RGB input.
+    
+    For emotion transfer, we want:
+    - Strong constraint on LL (preserve identity/structure)
+    - Relaxed constraint on HF (allow expression changes)
+    - Optional: magnitude/phase separation for fine control
+    """
+    
+    def __init__(self, use_magnitude_phase=False):
+        super().__init__()
+        self.use_magnitude_phase = use_magnitude_phase
+        
+        # VGG16 for perceptual loss on LL band
+        vgg = models.vgg16(weights=models.VGG16_Weights.IMAGENET1K_V1).features
+        self.vgg_blocks = nn.ModuleList([
+            vgg[:4],   # relu1_2
+            vgg[4:9],  # relu2_2
+            vgg[9:16], # relu3_3
+        ])
+        
+        for param in self.vgg_blocks.parameters():
+            param.requires_grad = False
+        
+        self.eval()
+    
+    def forward(self, generated, target, lambda_ll=0.3, lambda_hi=1.0, 
+                lambda_magnitude=0.5, lambda_phase=0.1):
+        """
+        Args:
+            generated: Generated image in [-1, 1]
+            target: Target image in [-1, 1]
+            lambda_ll: Weight for perceptual loss on LL band
+            lambda_hi: Weight for L1 loss on HF bands
+            lambda_magnitude: Weight for magnitude consistency (if use_magnitude_phase=True)
+            lambda_phase: Weight for phase consistency (if use_magnitude_phase=True)
+        """
+        from model_dtcwt_v2 import DTCWTWrapper
+        dtcwt = DTCWTWrapper().to(generated.device)
+        
+        # DTCWT decomposition: ll at H×W, mag/phase at H/2×W/2
+        gen_ll, gen_mag, gen_phase = dtcwt(generated)
+        target_ll, target_mag, target_phase = dtcwt(target)
+        
+        # Reconstruct real/imag from mag/phase
+        gen_hf_real = gen_mag * torch.cos(gen_phase)
+        gen_hf_imag = gen_mag * torch.sin(gen_phase)
+        target_hf_real = target_mag * torch.cos(target_phase)
+        target_hf_imag = target_mag * torch.sin(target_phase)
+        
+        # === LL Band: VGG Perceptual Loss ===
+        # Normalize to [0, 1] for VGG
+        gen_ll_norm = (gen_ll + 1) / 2
+        target_ll_norm = (target_ll + 1) / 2
+        
+        # Resize to 224x224 for VGG
+        gen_ll_resized = F.interpolate(gen_ll_norm, size=(224, 224), mode='bilinear')
+        target_ll_resized = F.interpolate(target_ll_norm, size=(224, 224), mode='bilinear')
+        
+        # ImageNet normalization
+        mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(generated.device)
+        std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(generated.device)
+        gen_ll_vgg = (gen_ll_resized - mean) / std
+        target_ll_vgg = (target_ll_resized - mean) / std
+        
+        # Compute perceptual loss
+        perceptual_loss = 0.0
+        gen_feats = gen_ll_vgg
+        target_feats = target_ll_vgg
+        
+        for block in self.vgg_blocks:
+            gen_feats = block(gen_feats)
+            target_feats = block(target_feats)
+            perceptual_loss += F.l1_loss(gen_feats, target_feats)
+        
+        # === HF Bands: 6-Orientation Loss ===
+        if self.use_magnitude_phase:
+            # Compute magnitude and phase from complex wavelet
+            gen_magnitude = torch.sqrt(gen_hf_real**2 + gen_hf_imag**2 + 1e-8)
+            target_magnitude = torch.sqrt(target_hf_real**2 + target_hf_imag**2 + 1e-8)
+            
+            gen_phase = torch.atan2(gen_hf_imag, gen_hf_real)
+            target_phase = torch.atan2(target_hf_imag, target_hf_real)
+            
+            # Magnitude loss (texture/edges)
+            magnitude_loss = F.l1_loss(gen_magnitude, target_magnitude)
+            
+            # Phase loss (position/structure) - use circular distance
+            phase_diff = gen_phase - target_phase
+            phase_loss = torch.mean(1 - torch.cos(phase_diff))
+            
+            hi_loss = lambda_magnitude * magnitude_loss + lambda_phase * phase_loss
+        else:
+            # Simple L1 loss on real and imaginary parts
+            hi_loss_real = F.l1_loss(gen_hf_real, target_hf_real)
+            hi_loss_imag = F.l1_loss(gen_hf_imag, target_hf_imag)
+            hi_loss = (hi_loss_real + hi_loss_imag) / 2
+        
+        # Combine losses
+        total_loss = lambda_ll * perceptual_loss + lambda_hi * hi_loss
+        
+        return total_loss
+    
+    def forward_with_details(self, generated, target, lambda_ll=0.3, lambda_hi=1.0):
+        """Forward pass that returns individual loss components for debugging."""
+        from model_dtcwt_v2 import DTCWTWrapper
+        dtcwt = DTCWTWrapper().to(generated.device)
+        
+        gen_ll, gen_mag, gen_phase = dtcwt(generated)
+        target_ll, target_mag, target_phase = dtcwt(target)
+        
+        # Concatenate mag+phase as HF representation for L1 comparison
+        gen_hf = torch.cat([gen_mag, gen_phase], dim=1)
+        target_hf = torch.cat([target_mag, target_phase], dim=1)
+        
+        # LL perceptual
+        gen_ll_norm = (gen_ll + 1) / 2
+        target_ll_norm = (target_ll + 1) / 2
+        gen_ll_resized = F.interpolate(gen_ll_norm, size=(224, 224), mode='bilinear')
+        target_ll_resized = F.interpolate(target_ll_norm, size=(224, 224), mode='bilinear')
+        
+        mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(generated.device)
+        std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(generated.device)
+        gen_ll_vgg = (gen_ll_resized - mean) / std
+        target_ll_vgg = (target_ll_resized - mean) / std
+        
+        perceptual_loss = 0.0
+        for block in self.vgg_blocks:
+            gen_ll_vgg = block(gen_ll_vgg)
+            target_ll_vgg = block(target_ll_vgg)
+            perceptual_loss += F.l1_loss(gen_ll_vgg, target_ll_vgg)
+        
+        hi_loss = F.l1_loss(gen_hf, target_hf)
+        total_loss = lambda_ll * perceptual_loss + lambda_hi * hi_loss
+        
+        return {
+            'total': total_loss,
+            'll_perceptual': perceptual_loss,
+            'hf_l1': hi_loss,
+            'lambda_ll': lambda_ll,
+            'lambda_hi': lambda_hi
+        }
+
+
+
+
+class CoarseStructureLoss_DTCWT(nn.Module):
+    """
+    Coarse Structure Loss using 2-Level LL decomposition.
+    
+    Ý tưởng:
+    - Level 1 LL: Vẫn chứa thông tin expression (nếp nhăn, miệng cười/buồn)
+    - Level 2 LL: Chỉ chứa cấu trúc thô (hình dáng, tỉ lệ khuôn mặt)
+    
+    Bằng cách chỉ preserve Level 2 LL, ta cho phép model thay đổi expression
+    trong khi vẫn giữ identity/structure cơ bản.
+    
+    Ưu điểm so với VGG Perceptual Loss:
+    - Gradient đơn giản (L1 loss trực tiếp)
+    - Không có conflict với DDPM loss
+    - Cho phép thay đổi expression tự do
+    """
+    
+    def __init__(self, num_levels=2):
+        super().__init__()
+        self.num_levels = num_levels  # Số lần downsample LL band
+    
+    def forward(self, generated, target, lambda_structure=1.0):
+        """
+        Args:
+            generated: Generated image in [-1, 1], shape (B, 3, H, W)
+            target: Target (source) image in [-1, 1], shape (B, 3, H, W)
+            lambda_structure: Weight for structure loss
+            
+        Returns:
+            Coarse structure loss (scalar)
+        """
+        from model_dtcwt_v2 import DTCWTWrapper
+        dtcwt = DTCWTWrapper().to(generated.device)
+        
+        # DTCWT decomposition
+        gen_ll, _, _ = dtcwt(generated)     # (B, 3, H, W)
+        target_ll, _, _ = dtcwt(target)
+        
+        # Downsample to coarser levels to get pure structure
+        # Each level removes more expression details
+        for _ in range(self.num_levels - 1):
+            gen_ll = F.avg_pool2d(gen_ll, kernel_size=2)
+            target_ll = F.avg_pool2d(target_ll, kernel_size=2)
+        
+        # Now gen_ll and target_ll are at coarse resolution
+        # e.g., for 224x224 input with num_levels=2: (B, 3, 56, 56)
+        # This captures only face shape, proportions, positions
+        # NOT expression details like smile/frown
+        
+        # Simple L1 loss on coarse structure
+        structure_loss = F.l1_loss(gen_ll, target_ll)
+        
+        return lambda_structure * structure_loss
+    
+    def forward_with_details(self, generated, target, lambda_structure=1.0):
+        """Forward with detailed output for debugging."""
+        from model_dtcwt_v2 import DTCWTWrapper
+        dtcwt = DTCWTWrapper().to(generated.device)
+        
+        gen_ll, _, _ = dtcwt(generated)
+        target_ll, _, _ = dtcwt(target)
+        
+        # Store intermediate LL sizes
+        ll_sizes = [gen_ll.shape]
+        
+        for _ in range(self.num_levels - 1):
+            gen_ll = F.avg_pool2d(gen_ll, kernel_size=2)
+            target_ll = F.avg_pool2d(target_ll, kernel_size=2)
+            ll_sizes.append(gen_ll.shape)
+        
+        structure_loss = F.l1_loss(gen_ll, target_ll)
+        
+        return {
+            'loss': lambda_structure * structure_loss,
+            'raw_loss': structure_loss,
+            'num_levels': self.num_levels,
+            'll_sizes': ll_sizes,
+            'final_resolution': gen_ll.shape[-1]
+        }
 
 
 class AdaptiveLossWeighter(nn.Module):

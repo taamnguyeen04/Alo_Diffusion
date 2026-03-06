@@ -10,5 +10,7 @@
 affecnet7_epoch6_acc0.6569.pth
 /venv
 /WaveletDiffusion_phase1
+/DTCWT_v2_film_DWT
+/x_TamNTM
 __pycache__
 .idea
