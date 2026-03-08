@@ -1,0 +1,95 @@
+﻿Device: cuda
+GPU: NVIDIA GeForce RTX 4050 Laptop GPU
+VRAM: 6.4 GB
+
+============================================================
+  Loading Model from Checkpoint
+============================================================
+  Checkpoint epoch: 0
+  Checkpoint step: 35485
+  Checkpoint loss: 1.3259296417236328
+  Total params: 19,889,039 (19.9M)
+
+  Loading test images...
+  Loaded 4 images from Affectnet validation set
+
+############################################################
+  RUNNING ALL DIAGNOSTIC TESTS
+############################################################
+
+============================================================
+  Test 1: Checkpoint Integrity & Weight Statistics
+============================================================
+  UNet input_conv[0]: shape=(48, 10, 3, 3), mean=-0.005886, std=0.073258, max=0.422877, NaN=False, Inf=False
+  UNet input_conv[1]: shape=(48,), mean=0.010890, std=0.066784, max=0.142258, NaN=False, Inf=False
+  UNet noise_head[0]: shape=(3, 48, 3, 3), mean=0.000280, std=0.063390, max=0.501660, NaN=False, Inf=False
+  UNet noise_head[1]: shape=(3,), mean=-0.001703, std=0.038461, max=0.046087, NaN=False, Inf=False
+  UNet dmag_head[0]: shape=(18, 48, 3, 3), mean=-0.000042, std=0.001044, max=0.004819, NaN=False, Inf=False
+  UNet dmag_head[1]: shape=(18,), mean=0.000641, std=0.001188, max=0.003743, NaN=False, Inf=False
+  MagnitudeModulator dir_attn[0]: shape=(32, 64), mean=0.000617, std=0.072712, max=0.180820, NaN=False, Inf=False
+  MagnitudeModulator dir_attn[1]: shape=(32,), mean=-0.002195, std=0.092288, max=0.168824, NaN=False, Inf=False
+  MagnitudeModulator dir_attn[2]: shape=(6, 32), mean=0.001750, std=0.109810, max=0.232250, NaN=False, Inf=False
+  MagnitudeModulator dir_attn[3]: shape=(6,), mean=-0.082409, std=0.087279, max=0.211099, NaN=False, Inf=False
+  MagnitudeModulator delta_pred[0]: shape=(64, 64), mean=0.000070, std=0.071584, max=0.144448, NaN=False, Inf=False
+  MagnitudeModulator delta_pred[1]: shape=(64,), mean=-0.000616, std=0.063635, max=0.126369, NaN=False, Inf=False
+  MagnitudeModulator delta_pred[2]: shape=(3, 64), mean=-0.004320, std=0.067321, max=0.126615, NaN=False, Inf=False
+  MagnitudeModulator delta_pred[3]: shape=(3,), mean=0.005579, std=0.110867, max=0.122320, NaN=False, Inf=False
+  MagnitudeModulator mag_scale: value = 0.001762 (init=0.1)
+  HF Encoder init_proj[0]: shape=(48, 36, 3, 3), mean=0.031321, std=0.216729, max=1.533375, NaN=False, Inf=False
+  HF Encoder init_proj[1]: shape=(48,), mean=-0.011514, std=0.222284, max=0.488636, NaN=False, Inf=False
+  HF Encoder init_proj[2]: shape=(48,), mean=0.942962, std=0.142463, max=1.348228, NaN=False, Inf=False
+  HF Encoder init_proj[3]: shape=(48,), mean=0.134973, std=0.181250, max=0.540696, NaN=False, Inf=False
+
+  Emotion Embedding Analysis:
+    Neutral   : L2 norm = 7.6418
+    Happy     : L2 norm = 6.6685
+    Sad       : L2 norm = 7.9960
+    Surprise  : L2 norm = 7.2521
+    Fear      : L2 norm = 7.9800
+    Disgust   : L2 norm = 7.9878
+    Anger     : L2 norm = 7.5751
+
+  Emotion Embedding Pairwise Cosine Similarity:
+    Neutral   : 1.00 -0.02 -0.05 0.06 -0.03 0.02 0.07
+    Happy     : -0.02 1.00 0.13 0.00 0.17 0.14 0.14
+    Sad       : -0.05 0.13 1.00 0.08 0.09 -0.03 0.09
+    Surprise  : 0.06 0.00 0.08 1.00 0.10 0.00 0.11
+    Fear      : -0.03 0.17 0.09 0.10 1.00 -0.17 0.20
+    Disgust   : 0.02 0.14 -0.03 0.00 -0.17 1.00 -0.08
+    Anger     : 0.07 0.14 0.09 0.11 0.20 -0.08 1.00
+
+============================================================
+  Test 2: DTCWT Roundtrip Fidelity
+============================================================
+  MSE:  0.00000008
+  PSNR: 76.50 dB
+  LL shape:    torch.Size([4, 3, 224, 224])
+  Mag shape:   torch.Size([4, 18, 112, 112])
+  Phase shape: torch.Size([4, 18, 112, 112])
+  Mag range:   [0.0001, 0.9250]
+  Phase range: [-3.1416, 3.1416]
+  Saved: debug_ghosting_output/02_dtcwt_roundtrip.png
+
+============================================================
+  Test 3: LL-Only Reconstruction (bypass APT)
+python : Traceback (most recent call last):
+At line:1 char:30
++ & venv\Scripts\Activate.ps1; python debug_ghosting.py 2>&1 | Out-File ...
++                              ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (Traceback (most recent call last): 
+   :String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+============================================================
+  File "C:\Users\tam\Documents\GitHub\Alo_Diffusion\debug_ghosting.py", line 
+670, in <module>
+    test_ll_only(model, images, emotions)
+  File "C:\Users\tam\Documents\GitHub\Alo_Diffusion\debug_ghosting.py", line 
+222, in test_ll_only
+    print("  If ghosting appears here \u2192 problem is in LL diffusion")
+  File 
+"C:\Users\tam\AppData\Local\Programs\Python\Python310\lib\encodings\cp1252.py", 
+line 19, in encode
+    return codecs.charmap_encode(input,self.errors,encoding_table)[0]
+UnicodeEncodeError: 'charmap' codec can't encode character '\u2192' in position 
+27: character maps to <undefined>

@@ -227,7 +227,10 @@ class CrossAttention(nn.Module):
         k = self.to_k(emotion_expanded).view(B, H*W, self.num_heads, self.head_dim).transpose(1, 2)
         v = self.to_v(emotion_expanded).view(B, H*W, self.num_heads, self.head_dim).transpose(1, 2)
         
-        attn = torch.softmax(torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim), dim=-1)
+        attn = torch.softmax(
+            (torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)).float(),
+            dim=-1
+        ).to(q.dtype)
         out = torch.matmul(attn, v)
         out = out.transpose(1, 2).contiguous().view(B, H*W, C)
         out = self.to_out(out).transpose(1, 2).view(B, C, H, W)
@@ -603,80 +606,85 @@ class AnalyticPhaseTransport(nn.Module):
             u: (B, 2, H1, W1) — displacement field at scale-1 resolution
                u[:,0] = dy, u[:,1] = dx (pixel units)
         """
-        phases_src, mags_src = self._extract_y_phases_mags(ll_y_src)
-        phases_tgt, mags_tgt = self._extract_y_phases_mags(ll_y_tgt)
-        
-        u = None  # will be initialized at coarsest scale
-        
-        # Coarse-to-fine: from scale J-1 (coarsest) to scale 0 (finest)
-        for s in range(self.J_apt - 1, -1, -1):
-            phase_src = phases_src[s]  # (B, 6, Hs, Ws)
-            phase_tgt = phases_tgt[s]
-            mag_src = mags_src[s]
-            mag_tgt = mags_tgt[s]
+        # Force fp32 — determinant division is unstable in fp16
+        with torch.amp.autocast('cuda', enabled=False):
+            ll_y_src = ll_y_src.float()
+            ll_y_tgt = ll_y_tgt.float()
             
-            B, _, Hs, Ws = phase_src.shape
-            K_s = getattr(self, f'K_scale{s}')  # (6, 2)
+            phases_src, mags_src = self._extract_y_phases_mags(ll_y_src)
+            phases_tgt, mags_tgt = self._extract_y_phases_mags(ll_y_tgt)
             
-            # Phase difference with wrapping
-            dphi = _wrap_phase(phase_tgt - phase_src)  # (B, 6, Hs, Ws)
+            u = None  # will be initialized at coarsest scale
             
-            # If we have a coarser estimate, subtract predicted phase shift
-            if u is not None:
-                u_up = F.interpolate(u, size=(Hs, Ws), mode='bilinear',
-                                     align_corners=False)
-                # Predicted phase from current u: k·u for each orientation
-                # K_s: (6,2), u_up: (B,2,H,W) → pred: (B,6,H,W)
-                pred_phase = (K_s[:, 0].view(1, 6, 1, 1) * u_up[:, 0:1] +
-                              K_s[:, 1].view(1, 6, 1, 1) * u_up[:, 1:2])
-                dphi = _wrap_phase(dphi - pred_phase)
+            # Coarse-to-fine: from scale J-1 (coarsest) to scale 0 (finest)
+            for s in range(self.J_apt - 1, -1, -1):
+                phase_src = phases_src[s]  # (B, 6, Hs, Ws)
+                phase_tgt = phases_tgt[s]
+                mag_src = mags_src[s]
+                mag_tgt = mags_tgt[s]
+                
+                B, _, Hs, Ws = phase_src.shape
+                K_s = getattr(self, f'K_scale{s}')  # (6, 2)
+                
+                # Phase difference with wrapping
+                dphi = _wrap_phase(phase_tgt - phase_src)  # (B, 6, Hs, Ws)
+                
+                # If we have a coarser estimate, subtract predicted phase shift
+                if u is not None:
+                    u_up = F.interpolate(u, size=(Hs, Ws), mode='bilinear',
+                                         align_corners=False)
+                    # Predicted phase from current u: k·u for each orientation
+                    # K_s: (6,2), u_up: (B,2,H,W) → pred: (B,6,H,W)
+                    pred_phase = (K_s[:, 0].view(1, 6, 1, 1) * u_up[:, 0:1] +
+                                  K_s[:, 1].view(1, 6, 1, 1) * u_up[:, 1:2])
+                    dphi = _wrap_phase(dphi - pred_phase)
+                
+                # Confidence weights: minimum of src/tgt magnitude
+                alpha = torch.minimum(mag_src, mag_tgt)  # (B, 6, Hs, Ws)
+                alpha = alpha / (alpha.sum(dim=1, keepdim=True) + 1e-8)
+                
+                # Weighted least-squares per pixel: solve K^T diag(α) K u = K^T diag(α) Δϕ
+                Ky = K_s[:, 0]  # (6,)
+                Kx = K_s[:, 1]  # (6,)
+                
+                # Weighted components
+                aKy = alpha * Ky.view(1, 6, 1, 1)   # (B,6,H,W)
+                aKx = alpha * Kx.view(1, 6, 1, 1)
+                
+                # 2x2 normal matrix entries
+                a11 = (aKy * Ky.view(1, 6, 1, 1)).sum(dim=1)  # (B,H,W)
+                a12 = (aKy * Kx.view(1, 6, 1, 1)).sum(dim=1)
+                a22 = (aKx * Kx.view(1, 6, 1, 1)).sum(dim=1)
+                
+                # RHS
+                b1 = (aKy * dphi).sum(dim=1)  # (B,H,W)
+                b2 = (aKx * dphi).sum(dim=1)
+                
+                # Solve 2x2 system: det = a11*a22 - a12^2
+                # Use larger eps (1e-6) for numerical stability
+                det = a11 * a22 - a12 * a12 + 1e-6
+                du_y = (a22 * b1 - a12 * b2) / det
+                du_x = (a11 * b2 - a12 * b1) / det
+                
+                du = torch.stack([du_y, du_x], dim=1)  # (B, 2, Hs, Ws)
+                
+                if u is not None:
+                    u = u_up + du
+                else:
+                    u = du
             
-            # Confidence weights: minimum of src/tgt magnitude
-            alpha = torch.minimum(mag_src, mag_tgt)  # (B, 6, Hs, Ws)
-            alpha = alpha / (alpha.sum(dim=1, keepdim=True) + 1e-8)
+            # Smooth displacement field
+            if self.smooth_kernel is not None:
+                pad = self.smooth_pad
+                kernel = self.smooth_kernel  # (1,1,ks,ks)
+                u_y = F.conv2d(F.pad(u[:, 0:1], [pad]*4, mode='reflect'),
+                               kernel)
+                u_x = F.conv2d(F.pad(u[:, 1:2], [pad]*4, mode='reflect'),
+                               kernel)
+                u = torch.cat([u_y, u_x], dim=1)
             
-            # Weighted least-squares per pixel: solve K^T diag(α) K u = K^T diag(α) Δϕ
-            # K: (6,2), α: (B,6,H,W), Δϕ: (B,6,H,W)
-            # A = K^T diag(α) K → (B, 2, 2, H, W)
-            # b = K^T diag(α) Δϕ → (B, 2, H, W)
-            
-            Ky = K_s[:, 0]  # (6,)
-            Kx = K_s[:, 1]  # (6,)
-            
-            # Weighted components
-            aKy = alpha * Ky.view(1, 6, 1, 1)   # (B,6,H,W)
-            aKx = alpha * Kx.view(1, 6, 1, 1)
-            
-            # 2x2 normal matrix entries
-            a11 = (aKy * Ky.view(1, 6, 1, 1)).sum(dim=1)  # (B,H,W)
-            a12 = (aKy * Kx.view(1, 6, 1, 1)).sum(dim=1)
-            a22 = (aKx * Kx.view(1, 6, 1, 1)).sum(dim=1)
-            
-            # RHS
-            b1 = (aKy * dphi).sum(dim=1)  # (B,H,W)
-            b2 = (aKx * dphi).sum(dim=1)
-            
-            # Solve 2x2 system: det = a11*a22 - a12^2
-            det = a11 * a22 - a12 * a12 + 1e-8
-            du_y = (a22 * b1 - a12 * b2) / det
-            du_x = (a11 * b2 - a12 * b1) / det
-            
-            du = torch.stack([du_y, du_x], dim=1)  # (B, 2, Hs, Ws)
-            
-            if u is not None:
-                u = u_up + du
-            else:
-                u = du
-        
-        # Smooth displacement field
-        if self.smooth_kernel is not None:
-            pad = self.smooth_pad
-            kernel = self.smooth_kernel  # (1,1,ks,ks)
-            u_y = F.conv2d(F.pad(u[:, 0:1], [pad]*4, mode='reflect'),
-                           kernel)
-            u_x = F.conv2d(F.pad(u[:, 1:2], [pad]*4, mode='reflect'),
-                           kernel)
-            u = torch.cat([u_y, u_x], dim=1)
+            # Clamp displacement to prevent extreme warps
+            u = u.clamp(-50, 50)
         
         return u
     
@@ -689,23 +697,25 @@ class AnalyticPhaseTransport(nn.Module):
         Returns:
             grid: (B, H, W, 2) — normalized grid for grid_sample (x, y order)
         """
-        B, _, H, W = u.shape
-        # Base grid: identity mapping
-        yy = torch.arange(H, device=u.device, dtype=u.dtype)
-        xx = torch.arange(W, device=u.device, dtype=u.dtype)
-        grid_y, grid_x = torch.meshgrid(yy, xx, indexing='ij')
-        
-        # Add displacement
-        new_y = grid_y.unsqueeze(0) + u[:, 0]  # (B, H, W)
-        new_x = grid_x.unsqueeze(0) + u[:, 1]
-        
-        # Normalize to [-1, 1] for grid_sample
-        new_y = 2.0 * new_y / max(H - 1, 1) - 1.0
-        new_x = 2.0 * new_x / max(W - 1, 1) - 1.0
-        
-        # grid_sample expects (x, y) order
-        grid = torch.stack([new_x, new_y], dim=-1)  # (B, H, W, 2)
-        return grid
+        with torch.amp.autocast('cuda', enabled=False):
+            u = u.float()
+            B, _, H, W = u.shape
+            # Base grid: identity mapping
+            yy = torch.arange(H, device=u.device, dtype=torch.float32)
+            xx = torch.arange(W, device=u.device, dtype=torch.float32)
+            grid_y, grid_x = torch.meshgrid(yy, xx, indexing='ij')
+            
+            # Add displacement
+            new_y = grid_y.unsqueeze(0) + u[:, 0]  # (B, H, W)
+            new_x = grid_x.unsqueeze(0) + u[:, 1]
+            
+            # Normalize to [-1, 1] for grid_sample
+            new_y = 2.0 * new_y / max(H - 1, 1) - 1.0
+            new_x = 2.0 * new_x / max(W - 1, 1) - 1.0
+            
+            # grid_sample expects (x, y) order
+            grid = torch.stack([new_x, new_y], dim=-1)  # (B, H, W, 2)
+            return grid
     
     def warp_coefficients(self, src_mag, src_phase, u):
         """
@@ -721,42 +731,51 @@ class AnalyticPhaseTransport(nn.Module):
             warped_mag:   (B, 18, H/2, W/2)
             warped_phase: (B, 18, H/2, W/2)
         """
-        _, _, Hm, Wm = src_mag.shape
-        
-        # Resize u to match HF resolution if needed
-        if u.shape[2] != Hm or u.shape[3] != Wm:
-            u = F.interpolate(u, size=(Hm, Wm), mode='bilinear',
-                              align_corners=False)
-            # Scale displacement proportionally
-            u = u * (Hm / u.shape[2]) if u.shape[2] != Hm else u
-        
-        grid = self._make_warp_grid(u)
-        
-        # Warp magnitude (bilinear)
-        warped_mag = F.grid_sample(src_mag, grid, mode='bilinear',
-                                   padding_mode='border', align_corners=False)
-        
-        # Warp phase (bilinear on sin/cos to avoid discontinuity)
-        sin_phase = torch.sin(src_phase)
-        cos_phase = torch.cos(src_phase)
-        warped_sin = F.grid_sample(sin_phase, grid, mode='bilinear',
-                                   padding_mode='border', align_corners=False)
-        warped_cos = F.grid_sample(cos_phase, grid, mode='bilinear',
-                                   padding_mode='border', align_corners=False)
-        warped_phase = torch.atan2(warped_sin, warped_cos)
-        
-        # Phase correction from shift theorem: add k·u for scale 1
-        K_1 = self.K_scale0  # (6, 2) — scale 0 = finest scale
-        # Apply correction per orientation, for all 3 color channels (Y,Cb,Cr)
-        for d in range(6):
-            phase_corr = K_1[d, 0] * u[:, 0:1] + K_1[d, 1] * u[:, 1:2]  # (B,1,H,W)
-            # Channels d, d+6, d+12 correspond to Y, Cb, Cr for orientation d
-            warped_phase[:, d:d+1] = warped_phase[:, d:d+1] + phase_corr
-            warped_phase[:, d+6:d+7] = warped_phase[:, d+6:d+7] + phase_corr
-            warped_phase[:, d+12:d+13] = warped_phase[:, d+12:d+13] + phase_corr
-        
-        # Wrap to [-π, π]
-        warped_phase = _wrap_phase(warped_phase)
+        # Force fp32 — grid_sample + atan2 are unstable in fp16
+        with torch.amp.autocast('cuda', enabled=False):
+            src_mag = src_mag.float()
+            src_phase = src_phase.float()
+            u = u.float()
+            
+            _, _, Hm, Wm = src_mag.shape
+            
+            # Resize u to match HF resolution if needed
+            if u.shape[2] != Hm or u.shape[3] != Wm:
+                scale_h = Hm / u.shape[2]
+                scale_w = Wm / u.shape[3]
+                u = F.interpolate(u, size=(Hm, Wm), mode='bilinear',
+                                  align_corners=False)
+                # Scale displacement proportionally
+                u[:, 0] = u[:, 0] * scale_h
+                u[:, 1] = u[:, 1] * scale_w
+            
+            grid = self._make_warp_grid(u)
+            
+            # Warp magnitude (bilinear)
+            warped_mag = F.grid_sample(src_mag, grid, mode='bilinear',
+                                       padding_mode='border', align_corners=False)
+            
+            # Warp phase (bilinear on sin/cos to avoid discontinuity)
+            sin_phase = torch.sin(src_phase)
+            cos_phase = torch.cos(src_phase)
+            warped_sin = F.grid_sample(sin_phase, grid, mode='bilinear',
+                                       padding_mode='border', align_corners=False)
+            warped_cos = F.grid_sample(cos_phase, grid, mode='bilinear',
+                                       padding_mode='border', align_corners=False)
+            warped_phase = torch.atan2(warped_sin, warped_cos)
+            
+            # Phase correction from shift theorem: add k·u for scale 1
+            K_1 = self.K_scale0  # (6, 2) — scale 0 = finest scale
+            # Apply correction per orientation, for all 3 color channels (Y,Cb,Cr)
+            for d in range(6):
+                phase_corr = K_1[d, 0] * u[:, 0:1] + K_1[d, 1] * u[:, 1:2]  # (B,1,H,W)
+                # Channels d, d+6, d+12 correspond to Y, Cb, Cr for orientation d
+                warped_phase[:, d:d+1] = warped_phase[:, d:d+1] + phase_corr
+                warped_phase[:, d+6:d+7] = warped_phase[:, d+6:d+7] + phase_corr
+                warped_phase[:, d+12:d+13] = warped_phase[:, d+12:d+13] + phase_corr
+            
+            # Wrap to [-π, π]
+            warped_phase = _wrap_phase(warped_phase)
         
         return warped_mag, warped_phase
     
@@ -770,15 +789,18 @@ class AnalyticPhaseTransport(nn.Module):
         Returns:
             warped_skip: (B, 9, H/2, W/2)
         """
-        _, _, Hs, Ws = ll_hf_skip.shape
-        
-        if u.shape[2] != Hs or u.shape[3] != Ws:
-            u = F.interpolate(u, size=(Hs, Ws), mode='bilinear',
-                              align_corners=False)
-        
-        grid = self._make_warp_grid(u)
-        warped_skip = F.grid_sample(ll_hf_skip, grid, mode='bilinear',
-                                    padding_mode='border', align_corners=False)
+        with torch.amp.autocast('cuda', enabled=False):
+            ll_hf_skip = ll_hf_skip.float()
+            u = u.float()
+            _, _, Hs, Ws = ll_hf_skip.shape
+            
+            if u.shape[2] != Hs or u.shape[3] != Ws:
+                u = F.interpolate(u, size=(Hs, Ws), mode='bilinear',
+                                  align_corners=False)
+            
+            grid = self._make_warp_grid(u)
+            warped_skip = F.grid_sample(ll_hf_skip, grid, mode='bilinear',
+                                        padding_mode='border', align_corners=False)
         return warped_skip
 
 
@@ -1126,12 +1148,14 @@ class DirectionalWaveDiffusionModel(nn.Module):
         mod_dmag = self.mag_mod(emotion_emb)
         delta_mag = delta_mag + mod_dmag
         
-        # Clamp Δmag
-        delta_mag = 0.1 * torch.tanh(delta_mag)
+        # Clamp Δmag — allow full tanh range ±1.0 (was 0.1×tanh = ±0.1)
+        delta_mag = torch.tanh(delta_mag)
         
-        # Chrominance damping on Δmag
-        chroma_scale = 0.1
-        delta_mag[:, 6:, :, :] = delta_mag[:, 6:, :, :] * chroma_scale
+        # Chrominance damping on Δmag (out-of-place to avoid breaking autograd)
+        delta_mag = torch.cat([
+            delta_mag[:, :6, :, :],           # Y orientations: full range
+            delta_mag[:, 6:, :, :] * 0.3      # Cb/Cr: damped
+        ], dim=1)
         
         # 8. Predict clean LL
         pred_ll_half = self._predict_x0(noisy_ll, noise_pred, t)
@@ -1158,7 +1182,9 @@ class DirectionalWaveDiffusionModel(nn.Module):
         
         # 13. Compute losses
         ddpm_loss = F.l1_loss(noise_pred, noise)
-        mag_loss = F.l1_loss(delta_mag, torch.zeros_like(delta_mag))
+        # mag_loss: match predicted magnitude to TARGET magnitude (not zero!)
+        # This allows the model to learn meaningful HF changes
+        mag_loss = F.l1_loss(pred_mag, mag)
         chroma_loss = F.l1_loss(pred_ll_half[:, 1:3], ll[:, 1:3])
         
         # Displacement smoothness loss (TV regularization)
@@ -1170,6 +1196,9 @@ class DirectionalWaveDiffusionModel(nn.Module):
         pred_real = pred_mag * torch.cos(pred_phase)
         pred_imag = pred_mag * torch.sin(pred_phase)
         pred_img = self.idtcwt(pred_ll_full, pred_real, pred_imag)
+        
+        # Safety: replace any NaN/Inf from reconstruction (prevents poisoning DAN/LPIPS)
+        pred_img = torch.nan_to_num(pred_img, nan=0.0, posinf=1.0, neginf=-1.0)
         
         return {
             'ddpm_loss': ddpm_loss,
@@ -1234,8 +1263,11 @@ class DirectionalWaveDiffusionModel(nn.Module):
             # MagnitudeModulator bias
             mod_dm = self.mag_mod(emotion_emb)
             delta_mag = delta_mag + mod_dm
-            delta_mag = 0.1 * torch.tanh(delta_mag)
-            delta_mag[:, 6:, :, :] = delta_mag[:, 6:, :, :] * 0.1
+            delta_mag = torch.tanh(delta_mag)  # full range ±1.0 (was 0.1×tanh)
+            delta_mag = torch.cat([
+                delta_mag[:, :6, :, :],
+                delta_mag[:, 6:, :, :] * 0.3
+            ], dim=1)  # chroma damping (out-of-place)
             
             final_dmag = delta_mag
             

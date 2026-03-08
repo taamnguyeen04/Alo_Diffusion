@@ -1,0 +1,66 @@
+=== Checkpoint Info ===
+Epoch: 5
+Step: 584
+Loss: 1.523631
+
+=== MagnitudePhaseModulator Learned Scales ===
+  mag_scale (init=0.1):    0.081853
+  phase_scale (init=0.05): 0.052294
+
+=== Delta Output Heads (init=zeros) ===
+  unet.output_delta_mag.weight:
+    shape=[18, 48, 3, 3], mean=-0.000002, std=0.000214, abs_max=0.001631
+  unet.output_delta_mag.bias:
+    shape=[18], mean=0.000035, std=0.000919, abs_max=0.001308
+  unet.output_delta_phase.weight:
+    shape=[18, 48, 3, 3], mean=-0.000525, std=0.011176, abs_max=0.065908
+  unet.output_delta_phase.bias:
+    shape=[18], mean=0.000649, std=0.006215, abs_max=0.016729
+
+=== Direction Attention (dir_attn) ===
+  mag_phase_mod.dir_attn.0.bias: shape=[32], mean=-0.005679, std=0.082637
+  mag_phase_mod.dir_attn.0.weight: shape=[32, 64], mean=-0.002334, std=0.072242
+  mag_phase_mod.dir_attn.2.bias: shape=[6], mean=0.066142, std=0.120140
+  mag_phase_mod.dir_attn.2.weight: shape=[6, 32], mean=0.002992, std=0.104854
+
+=== Noise Prediction Head ===
+  unet.output_noise.weight: mean=0.000540, std=0.049527, abs_max=0.300855
+  unet.output_noise.bias: mean=-0.005396, std=0.022962, abs_max=0.024478
+
+=== Emotion Embedding ===
+  shape: [7, 64]
+    Neutral: L2 norm = 7.5751
+    Happy: L2 norm = 7.7031
+    Sad: L2 norm = 8.0131
+    Surprise: L2 norm = 8.1784
+    Fear: L2 norm = 8.3672
+    Disgust: L2 norm = 7.3720
+    Anger: L2 norm = 8.5140
+
+=== FiLM Parameters (first encoder block) ===
+  unet.encoder_blocks.0.0.film_beta.bias:
+    mean=-0.000305, std=0.005905, abs_max=0.016729
+  unet.encoder_blocks.0.0.film_beta.weight:
+    mean=0.000174, std=0.010219, abs_max=0.053792
+  unet.encoder_blocks.0.0.film_gamma.bias:
+    mean=0.996967, std=0.022032, abs_max=1.049830
+  unet.encoder_blocks.0.0.film_gamma.weight:
+    mean=-0.001211, std=0.020153, abs_max=0.143236
+
+=== NaN/Inf Check ===
+  Keys with NaN: None
+  Keys with Inf: None
+
+=== MagPhase Delta Predictor ===
+  mag_phase_mod.delta_pred.0.bias: mean=0.009522, std=0.072524, abs_max=0.123475
+  mag_phase_mod.delta_pred.0.weight: mean=0.001338, std=0.071565, abs_max=0.135230
+  mag_phase_mod.delta_pred.2.bias: mean=-0.023580, std=0.075254, abs_max=0.113094
+  mag_phase_mod.delta_pred.2.weight: mean=-0.006495, std=0.070537, abs_max=0.133798
+
+=== HF Condition Encoder ===
+  unet.hf_encoder.init_proj.0.weight: std=0.066120, abs_max=0.449660
+  unet.hf_encoder.init_proj.1.weight: std=0.050405, abs_max=1.171421
+
+=== Delta Phase vs Delta Mag ratio ===
+  Phase/Mag std ratio: 52.3x
+  Phase/Mag abs_max ratio: 40.4x

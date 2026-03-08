@@ -9,6 +9,7 @@ Key differences from train.py:
 """
 
 import os
+import sys
 import shutil
 import math
 import numpy as np
@@ -27,6 +28,73 @@ import lpips
 from model_dtcwt_v2 import DirectionalWaveDiffusionModel, DTCWTWrapper, IDTCWTWrapper, AnalyticPhaseTransport
 from dataset import Affectnet
 from criterions import Emotion_model, AdaptiveLossWeighter, PerceptualWaveletLoss_DTCWT, CoarseStructureLoss_DTCWT
+
+
+class TrainingWrapper(nn.Module):
+    """
+    Wraps model + loss functions for DataParallel.
+    All loss computation happens on each GPU independently.
+    Only scalar losses are returned and gathered across GPUs.
+    """
+    def __init__(self, model, dan_model, lpips_fn, coarse_loss_fn):
+        super().__init__()
+        self.model = model
+        self.dan = dan_model
+        self.lpips_fn = lpips_fn
+        self.coarse_loss_fn = coarse_loss_fn
+        # DAN normalization buffers (auto-replicated to each GPU)
+        self.register_buffer('dan_mean', torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
+        self.register_buffer('dan_std', torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
+
+    def forward(self, img_real, expr_org):
+        # Main model forward
+        outputs = self.model(img_real, expr_org, src_image=img_real)
+
+        ddpm_loss = outputs['ddpm_loss']
+        mag_loss = outputs['mag_loss']
+        chroma_loss = outputs['chroma_loss']
+        u_smooth_loss = outputs['u_smooth_loss']
+        pred_img = outputs['pred_img']
+
+        # DAN loss (computed on each GPU independently)
+        pred_img_clamp = torch.clamp(pred_img, -1, 1)
+        pred_img_norm = (pred_img_clamp + 1) / 2
+        dan_input = F.interpolate(pred_img_norm, size=(224, 224), mode='bilinear', align_corners=False)
+        dan_input = (dan_input - self.dan_mean) / self.dan_std
+        dan_out, _, _ = self.dan(dan_input)
+        dan_expr_loss = F.cross_entropy(dan_out, expr_org, label_smoothing=0.1)
+
+        # Coarse structure loss
+        coarse_loss = self.coarse_loss_fn(pred_img_clamp, img_real)
+
+        # LPIPS perceptual loss
+        lpips_loss = self.lpips_fn(pred_img_clamp, img_real).mean()
+
+        # PSNR + logging stats (no gradient needed)
+        with torch.no_grad():
+            mse = F.mse_loss(pred_img_clamp, img_real)
+            psnr = 10 * torch.log10(4 / mse)
+            dmag = outputs['delta_mag']
+            disp = outputs['displacement']
+            dmag_mean = dmag.abs().mean()
+            dmag_max = dmag.abs().max()
+            disp_mean = disp.abs().mean()
+            disp_max = disp.abs().max()
+
+        return {
+            'ddpm_loss': ddpm_loss,
+            'mag_loss': mag_loss,
+            'chroma_loss': chroma_loss,
+            'u_smooth_loss': u_smooth_loss,
+            'dan_expr_loss': dan_expr_loss,
+            'coarse_loss': coarse_loss,
+            'lpips_loss': lpips_loss,
+            'psnr': psnr,
+            'dmag_mean': dmag_mean,
+            'dmag_max': dmag_max,
+            'disp_mean': disp_mean,
+            'disp_max': disp_max,
+        }
 
 
 def save_checkpoint(filepath, epoch, step, model, optimizer, loss):
@@ -62,6 +130,7 @@ def load_checkpoint(filepath, model, optimizer, device):
     best_path = os.path.join(filepath, "best_model.pt")
 
     start_epoch = 0
+    step = 0
     best_loss = float('inf')
 
     for path_to_try in [last_path, best_path]:
@@ -71,7 +140,8 @@ def load_checkpoint(filepath, model, optimizer, device):
                 model.load_state_dict(checkpoint['model_state_dict'])
                 optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
                 start_epoch = checkpoint['epoch']
-                print(f"Loaded checkpoint from {os.path.basename(path_to_try)}, epoch {start_epoch}")
+                step = checkpoint['step']
+                print(f"Loaded checkpoint from {os.path.basename(path_to_try)}, epoch {start_epoch}, step {step}")
                 break
             except Exception as e:
                 print(f"Error loading {os.path.basename(path_to_try)}: {e}")
@@ -82,7 +152,7 @@ def load_checkpoint(filepath, model, optimizer, device):
         except:
             best_loss = float('inf')
 
-    return start_epoch, best_loss
+    return start_epoch, best_loss, step
 
 
 def train():
@@ -100,7 +170,7 @@ def train():
     # ============================
     # Hyperparameters
     # ============================
-    batch_size = 384          # Smaller default since DTCWT uses more memory
+    batch_size = 8          # Smaller default since DTCWT uses more memory
     lr = 4e-4
     num_epochs = 10
     image_size = 224
@@ -113,7 +183,7 @@ def train():
 
     # Loss weights
     lambda_ddpm = 1.0
-    lambda_mag = 0.5         # Magnitude preservation
+    lambda_mag = 0.1         # Magnitude matching (reduced: was 0.5 when L1(dmag,0); now L1(pred,target) is larger scale)
     lambda_dan_expr = 0.5    # DAN emotion loss (reduced: was 1.6, prevent adversarial optimization)
     lambda_coarse = 2.0      # Coarse structure preservation (boosted: was 1.0)
     lambda_chroma = 2.0      # Chrominance preservation (Cb/Cr LL)
@@ -130,7 +200,7 @@ def train():
     # ============================
     # Directories
     # ============================
-    exp_name = "DTCWT_v2_film_DWT"
+    exp_name = "DTCWT_apt"
     log_dir = f"{exp_name}/runs/exp"
     model_path = f"{exp_name}/model"
     out_path = f"{exp_name}/out"
@@ -178,7 +248,7 @@ def train():
     # Models
     # ============================
     print("Building models...")
-    model = DirectionalWaveDiffusionModel(
+    diff_model = DirectionalWaveDiffusionModel(
         num_emotions=num_emotions,
         features=features,
         use_film=use_film,
@@ -186,25 +256,15 @@ def train():
     ).to(device)
 
     # Count parameters
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total_params = sum(p.numel() for p in diff_model.parameters())
+    trainable_params = sum(p.numel() for p in diff_model.parameters() if p.requires_grad)
     print(f"Total params: {total_params:,} ({total_params/1e6:.1f}M)")
     print(f"Trainable params: {trainable_params:,} ({trainable_params/1e6:.1f}M)")
-
-    if num_gpus > 1:
-        print(f"Using DataParallel with {num_gpus} GPUs")
-        model = torch.nn.DataParallel(model)
-
-    base_model = model.module if num_gpus > 1 else model
 
     # DAN emotion model (frozen)
     emotion_model = Emotion_model()
     for param in emotion_model.model.parameters():
         param.requires_grad = False
-
-    # Adaptive loss weighting
-    initial_weights = {'lambda_dan_expr': lambda_dan_expr}
-    loss_weighter = AdaptiveLossWeighter(initial_weights, warmup_steps=5000)
 
     # Coarse structure loss (DTCWT-based)
     coarse_loss_fn = CoarseStructureLoss_DTCWT().to(device)
@@ -214,6 +274,21 @@ def train():
     lpips_fn.eval()
     for param in lpips_fn.parameters():
         param.requires_grad = False
+
+    # Adaptive loss weighting
+    initial_weights = {'lambda_dan_expr': lambda_dan_expr}
+    loss_weighter = AdaptiveLossWeighter(initial_weights, warmup_steps=5000)
+
+    # Training wrapper: bundles model + all loss functions
+    # DataParallel wraps THIS so each GPU computes its own losses
+    model = TrainingWrapper(diff_model, emotion_model.model, lpips_fn, coarse_loss_fn).to(device)
+
+    if num_gpus > 1:
+        print(f"Using DataParallel with {num_gpus} GPUs")
+        model = torch.nn.DataParallel(model)
+
+    # base_model = raw diffusion model (for checkpoints, sampling, attribute access)
+    base_model = model.module.model if num_gpus > 1 else diff_model
 
     # ============================
     # DTCWT Roundtrip Test
@@ -236,7 +311,7 @@ def train():
     # Separate learning rate for MagnitudePhaseModulator (learn slower)
     mod_params = []
     other_params = []
-    for name, param in base_model.named_parameters():
+    for name, param in diff_model.named_parameters():
         if 'mag_mod' in name:
             mod_params.append(param)
         else:
@@ -255,7 +330,22 @@ def train():
 
     # Load checkpoint
     print("Loading checkpoint...")
-    start_epoch, best_loss = load_checkpoint(model_path, base_model, optimizer, device)
+    start_epoch, best_loss, step = load_checkpoint(model_path, base_model, optimizer, device)
+
+    # Fix C: Reset collapsed mag_scale (0.0018 → 0.1)
+    # The old mag_loss=L1(dmag,0) caused this to collapse; with the new
+    # mag_loss=L1(pred_mag, target_mag) the modulator needs to be alive
+    with torch.no_grad():
+        old_val = base_model.mag_mod.mag_scale.item()
+        if old_val < 0.05:
+            base_model.mag_mod.mag_scale = torch.nn.Parameter(
+                torch.tensor(0.1, device=device)
+            )
+            # Re-register with optimizer (old reference is stale)
+            optimizer.param_groups[0]['params'].append(base_model.mag_mod.mag_scale)
+            print(f"  Reset mag_scale: {old_val:.6f} -> 0.1 (was collapsed)")
+        else:
+            print(f"  mag_scale OK: {old_val:.4f}")
 
     # Fixed validation samples
     x_fixed, expr_fixed, _, _ = next(iter(val_dataloader))
@@ -270,6 +360,9 @@ def train():
         for epoch in range(start_epoch, num_epochs):
             model.train()
 
+            # If resuming mid-epoch, skip already-processed batches
+            skip_batches = step % len(train_dataloader) if epoch == start_epoch and step > 0 else 0
+
             epoch_bar = tqdm(enumerate(train_dataloader), total=len(train_dataloader),
                              desc=f"Epoch {epoch}/{num_epochs}")
 
@@ -279,44 +372,27 @@ def train():
             img_every = max(1, total_iters // 2)     # Images ~2 times per epoch (mid + end)
 
             for i, (img_real, expr_org, _, _) in epoch_bar:
+                # Skip batches already processed (when resuming mid-epoch)
+                if skip_batches > 0:
+                    skip_batches -= 1
+                    continue
+
                 img_real = img_real.to(device)
                 expr_org = expr_org.to(device)
 
-                # ===== FORWARD PASS (AMP) =====
+                # ===== FORWARD PASS (AMP + DataParallel) =====
                 with torch.amp.autocast('cuda'):
-                    outputs = base_model(img_real, expr_org, src_image=img_real)
+                    outputs = model(img_real, expr_org)
 
-                    ddpm_loss = outputs['ddpm_loss']
-                    mag_loss = outputs['mag_loss']
-                    chroma_loss = outputs['chroma_loss']
-                    u_smooth_loss = outputs['u_smooth_loss']
-                    pred_img = outputs['pred_img']
-
-                    # ===== DAN LOSS =====
-                    pred_img_clamp = torch.clamp(pred_img, -1, 1)
-                    pred_img_norm = (pred_img_clamp + 1) / 2  # [-1,1] → [0,1]
-                    dan_input = F.interpolate(pred_img_norm, size=(224, 224), mode='bilinear', align_corners=False)
-
-                    mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(device)
-                    std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(device)
-                    dan_input = (dan_input - mean) / std
-
-                    dan_out, _, _ = emotion_model.model(dan_input)
-                    dan_expr_loss = F.cross_entropy(dan_out, expr_org, label_smoothing=0.1)
-
-                    # ===== COARSE STRUCTURE LOSS =====
-                    coarse_loss = coarse_loss_fn(pred_img_clamp, img_real)
-
-                    # ===== LPIPS PERCEPTUAL LOSS =====
-                    # Ensures generated image looks natural, not just fools DAN
-                    # LPIPS expects input in [-1, 1]
-                    lpips_loss = lpips_fn(pred_img_clamp, img_real).mean()
-
-                    # ===== METRICS (PSNR) =====
-                    with torch.no_grad():
-                        mse = F.mse_loss(pred_img_clamp, img_real)
-                        psnr = 10 * torch.log10(4 / mse)  # Max val=2 (range -1 to 1) -> 2^2=4
-
+                    # DataParallel gathers scalars as (num_gpus,) tensors → mean them
+                    ddpm_loss = outputs['ddpm_loss'].mean()
+                    mag_loss = outputs['mag_loss'].mean()
+                    chroma_loss = outputs['chroma_loss'].mean()
+                    u_smooth_loss = outputs['u_smooth_loss'].mean()
+                    dan_expr_loss = outputs['dan_expr_loss'].mean()
+                    coarse_loss = outputs['coarse_loss'].mean()
+                    lpips_loss = outputs['lpips_loss'].mean()
+                    psnr = outputs['psnr'].mean()
 
                     # ===== ADAPTIVE WEIGHTS =====
                     current_losses = {
@@ -337,11 +413,24 @@ def train():
                         lambda_lpips * lpips_loss
                     )
 
+                # ===== NaN GUARD =====
+                if not torch.isfinite(total_loss):
+                    nan_info = []
+                    for name, val in [('DDPM', ddpm_loss), ('Mag', mag_loss), 
+                                       ('Chroma', chroma_loss), ('Smooth', u_smooth_loss),
+                                       ('DAN', dan_expr_loss), ('Coarse', coarse_loss),
+                                       ('LPIPS', lpips_loss)]:
+                        if not torch.isfinite(val):
+                            nan_info.append(name)
+                    print(f"\n⚠ NaN/Inf at epoch {epoch}, step {i} — sources: {nan_info}")
+                    optimizer.zero_grad()
+                    continue
+
                 # ===== BACKWARD (AMP) =====
                 optimizer.zero_grad()
                 scaler.scale(total_loss).backward()
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 scaler.step(optimizer)
                 scaler.update()
 
@@ -355,7 +444,7 @@ def train():
                     "Coarse": f"{coarse_loss.item():.4f}"
                 })
 
-                step = epoch * total_iters + i
+                step += 1
 
                 if i % log_every == 0:
                     writer.add_scalar("Loss/Total", total_loss.item(), step)
@@ -367,18 +456,17 @@ def train():
                     writer.add_scalar("Loss/LPIPS", lpips_loss.item(), step)
                     writer.add_scalar("Metric/PSNR", psnr.item(), step)
                     writer.add_scalar("Weight/Lambda_DAN", current_lambda_dan, step)
+                    writer.add_scalar("Grad/Norm", grad_norm.item() if torch.is_tensor(grad_norm) else grad_norm, step)
 
-                    # Log DTCWT-specific metrics
+                    # Log DTCWT-specific metrics (pre-computed in wrapper)
+                    writer.add_scalar("DTCWT/DeltaMag_mean", outputs['dmag_mean'].mean().item(), step)
+                    writer.add_scalar("DTCWT/DeltaMag_max", outputs['dmag_max'].max().item(), step)
+                    writer.add_scalar("APT/Displacement_mean", outputs['disp_mean'].mean().item(), step)
+                    writer.add_scalar("APT/Displacement_max", outputs['disp_max'].max().item(), step)
+                    writer.add_scalar("APT/U_smooth_loss", u_smooth_loss.item(), step)
+
+                    # Log MagnitudeModulator direction attention
                     with torch.no_grad():
-                        dmag = outputs['delta_mag']
-                        disp = outputs['displacement']
-                        writer.add_scalar("DTCWT/DeltaMag_mean", dmag.abs().mean().item(), step)
-                        writer.add_scalar("DTCWT/DeltaMag_max", dmag.abs().max().item(), step)
-                        writer.add_scalar("APT/Displacement_mean", disp.abs().mean().item(), step)
-                        writer.add_scalar("APT/Displacement_max", disp.abs().max().item(), step)
-                        writer.add_scalar("APT/U_smooth_loss", u_smooth_loss.item(), step)
-
-                        # Log MagnitudeModulator direction attention
                         emotion_emb = base_model.unet.emotion_embedding(expr_org[:1])
                         dir_weights = base_model.mag_mod.dir_attn(emotion_emb)
                         for d in range(6):

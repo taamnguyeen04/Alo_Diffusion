@@ -1,4 +1,5 @@
 import os
+import math
 from PIL import Image
 import numpy as np
 import cv2
@@ -12,6 +13,7 @@ from torchvision.models import resnet50
 from dataset import Affectnet
 from torch.utils.data import Dataset, DataLoader
 from model_dtcwt_v2 import DWT
+from model_dtcwt_v2 import DTCWTWrapper
 
 class PerceptualWaveletLoss(nn.Module):
     """Perceptual loss for wavelet domain with separate handling of LL and HF bands"""
@@ -131,7 +133,6 @@ class PerceptualWaveletLoss_DTCWT(nn.Module):
             lambda_magnitude: Weight for magnitude consistency (if use_magnitude_phase=True)
             lambda_phase: Weight for phase consistency (if use_magnitude_phase=True)
         """
-        from model_dtcwt_v2 import DTCWTWrapper
         dtcwt = DTCWTWrapper().to(generated.device)
         
         # DTCWT decomposition: ll at H×W, mag/phase at H/2×W/2
@@ -199,7 +200,6 @@ class PerceptualWaveletLoss_DTCWT(nn.Module):
     
     def forward_with_details(self, generated, target, lambda_ll=0.3, lambda_hi=1.0):
         """Forward pass that returns individual loss components for debugging."""
-        from model_dtcwt_v2 import DTCWTWrapper
         dtcwt = DTCWTWrapper().to(generated.device)
         
         gen_ll, gen_mag, gen_phase = dtcwt(generated)
@@ -260,6 +260,7 @@ class CoarseStructureLoss_DTCWT(nn.Module):
     def __init__(self, num_levels=2):
         super().__init__()
         self.num_levels = num_levels  # Số lần downsample LL band
+        self.dtcwt = DTCWTWrapper()  # Persistent module, not recreated each call
     
     def forward(self, generated, target, lambda_structure=1.0):
         """
@@ -271,46 +272,44 @@ class CoarseStructureLoss_DTCWT(nn.Module):
         Returns:
             Coarse structure loss (scalar)
         """
-        from model_dtcwt_v2 import DTCWTWrapper
-        dtcwt = DTCWTWrapper().to(generated.device)
-        
-        # DTCWT decomposition
-        gen_ll, _, _ = dtcwt(generated)     # (B, 3, H, W)
-        target_ll, _, _ = dtcwt(target)
-        
-        # Downsample to coarser levels to get pure structure
-        # Each level removes more expression details
-        for _ in range(self.num_levels - 1):
-            gen_ll = F.avg_pool2d(gen_ll, kernel_size=2)
-            target_ll = F.avg_pool2d(target_ll, kernel_size=2)
-        
-        # Now gen_ll and target_ll are at coarse resolution
-        # e.g., for 224x224 input with num_levels=2: (B, 3, 56, 56)
-        # This captures only face shape, proportions, positions
-        # NOT expression details like smile/frown
-        
-        # Simple L1 loss on coarse structure
-        structure_loss = F.l1_loss(gen_ll, target_ll)
+        # Force fp32 — DTCWT is numerically unstable in fp16
+        with torch.amp.autocast('cuda', enabled=False):
+            generated = generated.float()
+            target = target.float()
+            
+            # DTCWT decomposition
+            gen_ll, _, _ = self.dtcwt(generated)     # (B, 3, H, W)
+            target_ll, _, _ = self.dtcwt(target)
+            
+            # Downsample to coarser levels to get pure structure
+            # Each level removes more expression details
+            for _ in range(self.num_levels - 1):
+                gen_ll = F.avg_pool2d(gen_ll, kernel_size=2)
+                target_ll = F.avg_pool2d(target_ll, kernel_size=2)
+            
+            # Simple L1 loss on coarse structure
+            structure_loss = F.l1_loss(gen_ll, target_ll)
         
         return lambda_structure * structure_loss
     
     def forward_with_details(self, generated, target, lambda_structure=1.0):
         """Forward with detailed output for debugging."""
-        from model_dtcwt_v2 import DTCWTWrapper
-        dtcwt = DTCWTWrapper().to(generated.device)
-        
-        gen_ll, _, _ = dtcwt(generated)
-        target_ll, _, _ = dtcwt(target)
-        
-        # Store intermediate LL sizes
-        ll_sizes = [gen_ll.shape]
-        
-        for _ in range(self.num_levels - 1):
-            gen_ll = F.avg_pool2d(gen_ll, kernel_size=2)
-            target_ll = F.avg_pool2d(target_ll, kernel_size=2)
-            ll_sizes.append(gen_ll.shape)
-        
-        structure_loss = F.l1_loss(gen_ll, target_ll)
+        with torch.amp.autocast('cuda', enabled=False):
+            generated = generated.float()
+            target = target.float()
+            
+            gen_ll, _, _ = self.dtcwt(generated)
+            target_ll, _, _ = self.dtcwt(target)
+            
+            # Store intermediate LL sizes
+            ll_sizes = [gen_ll.shape]
+            
+            for _ in range(self.num_levels - 1):
+                gen_ll = F.avg_pool2d(gen_ll, kernel_size=2)
+                target_ll = F.avg_pool2d(target_ll, kernel_size=2)
+                ll_sizes.append(gen_ll.shape)
+            
+            structure_loss = F.l1_loss(gen_ll, target_ll)
         
         return {
             'loss': lambda_structure * structure_loss,
@@ -337,10 +336,14 @@ class AdaptiveLossWeighter(nn.Module):
         self.step_count += 1
 
         for name, loss in losses.items():
+            loss_val = loss.item()
+            # Skip NaN/Inf — prevent permanent EMA poisoning
+            if not math.isfinite(loss_val):
+                continue
             if name not in self.loss_ema:
-                self.loss_ema[name] = loss.item()
+                self.loss_ema[name] = loss_val
             else:
-                self.loss_ema[name] = self.alpha * self.loss_ema[name] + (1 - self.alpha) * loss.item()
+                self.loss_ema[name] = self.alpha * self.loss_ema[name] + (1 - self.alpha) * loss_val
 
         if self.step_count < self.warmup_steps:
             if 'aux_expr' in self.loss_ema and self.loss_ema['aux_expr'] < 0.05:
