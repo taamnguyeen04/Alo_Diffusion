@@ -818,7 +818,7 @@ class DirectionalWaveDiffusionUNet(nn.Module):
     Phase is handled by Analytic Phase Transport (APT), not regression.
     """
     def __init__(self,
-                 in_channels=11,    # 3 LL + 8 emotion one-hot
+                 in_channels=20,    # 12 wavelet (LL+LH+HL+HH) + 8 emotion one-hot
                  features=None,
                  time_dim=256,
                  emotion_dim=64,
@@ -898,8 +898,8 @@ class DirectionalWaveDiffusionUNet(nn.Module):
         )
         self.shared_output = shared_out
         
-        # LL noise prediction head
-        self.output_noise = nn.Conv2d(features[0], 3, 3, padding=1)
+        # Wavelet noise/velocity prediction head (12ch: LL + LH + HL + HH)
+        self.output_noise = nn.Conv2d(features[0], 12, 3, padding=1)
         
         # Δmagnitude head (init to zero → identity at start)
         # UNet is at H/2 which matches HF resolution — no pooling needed
@@ -979,48 +979,47 @@ class DirectionalWaveDiffusionUNet(nn.Module):
 
 class DirectionalWaveDiffusionModel(nn.Module):
     """
-    Complete diffusion model with Analytic Phase Transport (APT).
+    V3: Full 12-channel Wavelet Diffusion with Rectified Flow.
     
-    Pipeline: DTCWT decomposition → LL diffusion → APT displacement estimation
-    → warp source HF + Δmag modulation → IDTCWT reconstruction.
-    
-    Phase is no longer regressed by the UNet. Instead, the displacement field
-    u(x) is estimated from DTCWT phase differences between source and denoised
-    LL, and source HF is warped geometrically.
+    Pipeline:
+    1. DTCWT decompose → LL (112x112)
+    2. Haar DWT → 12ch (56x56): LL(3) + LH(3) + HL(3) + HH(3)
+    3. Per-channel normalize (balance LL vs HF variance)
+    4. Rectified Flow: x_t = (1-t)*x_0 + t*noise
+    5. UNet predicts velocity v = noise - x_0 on all 12ch
+    6. Un-normalize → Haar IWT → LL' (112x112)
+    7. APT warp DTCWT coefficients + delta_mag → IDTCWT reconstruct
     """
     def __init__(self,
                  num_emotions=8,
-                 num_timesteps=1000,
-                 beta_start=1e-4,
-                 beta_end=2e-2,
                  features=None,
                  use_film=True,
-                 use_adagn=False):
+                 use_adagn=False,
+                 wavelet_stats_path='wavelet_stats.pt'):
         super().__init__()
         if features is None:
             features = [48, 96, 192, 384]
         
-        self.num_timesteps = num_timesteps
         self.num_emotions = num_emotions
         
         # DTCWT decomposition / reconstruction
         self.dtcwt = DTCWTWrapper()
         self.idtcwt = IDTCWTWrapper()
         
-        # LL downsample/upsample (H×W ↔ H/2×W/2)
+        # Haar DWT/IWT for LL → 12ch
         self.ll_dwt = DWT()
         self.ll_iwt = IWT()
         
-        # Analytic Phase Transport — replaces Δphase regression
+        # Analytic Phase Transport (for DTCWT HF warp only)
         self.apt = AnalyticPhaseTransport()
         
-        # Magnitude Modulator (emotion × direction, phase no longer modulated)
+        # Magnitude Modulator
         emotion_dim = 64
         self.mag_mod = MagnitudeModulator(emotion_dim)
         
-        # UNet: input = 3 LL + num_emotions one-hot
+        # UNet: input = 12 wavelet channels + num_emotions one-hot
         self.unet = DirectionalWaveDiffusionUNet(
-            in_channels=3 + num_emotions,
+            in_channels=12 + num_emotions,
             features=features,
             emotion_dim=emotion_dim,
             num_emotions=num_emotions,
@@ -1028,180 +1027,180 @@ class DirectionalWaveDiffusionModel(nn.Module):
             use_adagn=use_adagn
         )
         
-        # Noise schedule
-        betas = torch.linspace(beta_start, beta_end, num_timesteps)
-        alphas = 1.0 - betas
-        alphas_cumprod = torch.cumprod(alphas, dim=0)
+        # Per-channel normalization buffers (Computed at pixel-level on 5000 images)
+        # LL range: mean=[0.01, 1.33], std=[0.46, 2.30]
+        # HF range: mean=[-0.0004, 0.0001], std=[0.004, 0.142]
+        ch_mean = torch.tensor([
+            0.011998, 0.896247, 1.325454, 
+            0.000061, 0.000009, -0.000009, 
+            -0.000450, 0.000131, -0.000311, 
+            0.000000, 0.000000, 0.000000
+        ]).view(1, 12, 1, 1)
         
-        self.register_buffer('betas', betas)
-        self.register_buffer('alphas', alphas)
-        self.register_buffer('alphas_cumprod', alphas_cumprod)
-        self.register_buffer('sqrt_alphas_cumprod', torch.sqrt(alphas_cumprod))
-        self.register_buffer('sqrt_one_minus_alphas_cumprod', torch.sqrt(1.0 - alphas_cumprod))
+        ch_std = torch.tensor([
+            2.295658, 0.460137, 0.533324, 
+            0.142199, 0.021581, 0.024577, 
+            0.129210, 0.019362, 0.023260, 
+            0.030509, 0.003963, 0.004416
+        ]).view(1, 12, 1, 1)
+
+        self.register_buffer('ch_mean', ch_mean)
+        self.register_buffer('ch_std', ch_std)
     
-    def ll_downsample(self, ll):
-        """
-        Downsample LL from H×W to H/2×W/2 using Haar DWT.
-        
-        Returns:
-            ll_sub: (B, 3, H/2, W/2) — LL subband (coarse structure)
-            ll_hf_skip: (B, 9, H/2, W/2) — LH+HL+HH subbands (detail skip)
-        """
-        ll_dwt = self.ll_dwt(ll)  # (B, 12, H/2, W/2) = 3ch × 4 subbands
-        C = ll.shape[1]  # 3
-        ll_sub = ll_dwt[:, :C, :, :]       # (B, 3, H/2, W/2) — LL only
-        ll_hf_skip = ll_dwt[:, C:, :, :]   # (B, 9, H/2, W/2) — LH+HL+HH
-        return ll_sub, ll_hf_skip
+    def normalize_wavelet(self, x):
+        """Per-channel normalize 12ch wavelet to ~N(0,1)."""
+        return (x - self.ch_mean) / (self.ch_std + 1e-6)
     
-    def ll_upsample(self, ll_sub, ll_hf_skip):
+    def unnormalize_wavelet(self, x):
+        """Undo per-channel normalization."""
+        return x * (self.ch_std + 1e-6) + self.ch_mean
+    
+    def _inject_emotion(self, x_wavelet, emotion_id):
         """
-        Upsample LL from H/2×W/2 back to H×W using Haar IWT.
+        StarGAN-style injection: concatenate one-hot emotion map to 12ch wavelet.
         
         Args:
-            ll_sub: (B, 3, H/2, W/2) — predicted/denoised LL subband
-            ll_hf_skip: (B, 9, H/2, W/2) — LH+HL+HH from source
-        Returns:
-            ll_full: (B, 3, H, W) — reconstructed LL at original resolution
-        """
-        ll_dwt = torch.cat([ll_sub, ll_hf_skip], dim=1)  # (B, 12, H/2, W/2)
-        return self.ll_iwt(ll_dwt)  # (B, 3, H, W)
-    
-    def _inject_emotion(self, x_ll, emotion_id):
-        """
-        StarGAN-style injection: concatenate one-hot emotion map to LL.
-        
-        Args:
-            x_ll: (B, 3, H/2, W/2) — noisy LL coefficients (downsampled)
+            x_wavelet: (B, 12, H/2, W/2) — normalized noisy wavelet
             emotion_id: (B,)
         Returns:
-            (B, 3 + num_emotions, H/2, W/2)
+            (B, 12 + num_emotions, H/2, W/2)
         """
-        B, C, H, W = x_ll.shape
-        emotion_onehot = F.one_hot(emotion_id, num_classes=self.num_emotions).to(dtype=x_ll.dtype)
+        B, C, H, W = x_wavelet.shape
+        emotion_onehot = F.one_hot(emotion_id, num_classes=self.num_emotions).to(dtype=x_wavelet.dtype)
         emotion_map = emotion_onehot[:, :, None, None].expand(B, self.num_emotions, H, W)
-        return torch.cat([x_ll, emotion_map], dim=1)
+        return torch.cat([x_wavelet, emotion_map], dim=1)
     
-    def forward_process(self, x0, t, noise=None):
-        """Add noise to LL coefficients at timestep t."""
-        if noise is None:
-            noise = torch.randn_like(x0)
-        sqrt_alpha = self.sqrt_alphas_cumprod[t][:, None, None, None]
-        sqrt_one_minus_alpha = self.sqrt_one_minus_alphas_cumprod[t][:, None, None, None]
-        return sqrt_alpha * x0 + sqrt_one_minus_alpha * noise, noise
-    
-    def _predict_x0(self, x_noisy, noise_pred, t):
-        """Predict clean x0 from noisy input and predicted noise."""
-        sqrt_alpha = self.sqrt_alphas_cumprod[t][:, None, None, None]
-        sqrt_one_minus_alpha = self.sqrt_one_minus_alphas_cumprod[t][:, None, None, None]
-        pred_x0 = (x_noisy - sqrt_one_minus_alpha * noise_pred) / sqrt_alpha
-        return torch.clamp(pred_x0, -3, 3)
-    
-    def forward(self, x, emotion_id, src_image=None):
+    def rf_forward(self, x0, t, noise=None):
         """
-        Training forward: compute losses.
-        
-        Pipeline:
-        1. DTCWT decompose target → LL, mag, phase
-        2. UNet denoises LL → noise_pred, Δmag
-        3. APT: estimate displacement u from phase diff(src_LL_Y, pred_LL_Y)
-        4. Warp source HF + Haar detail by u, apply Δmag
-        5. IDTCWT reconstruct
+        Rectified Flow forward: x_t = (1-t)*x0 + t*noise
         
         Args:
-            x: (B, 3, H, W) — target image
-            emotion_id: (B,) — emotion class
-            src_image: (B, 3, H, W) — source image for residual connection
+            x0: (B, 12, H, W) — clean normalized wavelet
+            t: (B,) — timestep in [0, 1]
+            noise: optional pre-generated noise
         Returns:
-            dict with losses and predicted image for DAN loss
+            x_t: (B, 12, H, W) — interpolated sample
+            velocity: (B, 12, H, W) — target velocity v = noise - x0
+        """
+        if noise is None:
+            noise = torch.randn_like(x0)
+        t_expand = t.view(-1, 1, 1, 1)
+        x_t = (1 - t_expand) * x0 + t_expand * noise
+        velocity = noise - x0
+        return x_t, velocity
+    
+    def forward(self, x, emotion_id, src_image=None, drop_prob=0.0):
+        """
+        V3 Training forward with Rectified Flow on 12ch normalized wavelet.
+        
+        Pipeline:
+        1. DTCWT decompose → LL (112x112), mag, phase
+        2. Haar DWT → 12ch (56x56)
+        3. Per-channel normalize → RF interpolation → UNet → velocity pred
+        4. Predict x0 → un-normalize → Haar IWT → LL' (112x112)
+        5. APT warp DTCWT coefficients + delta_mag
+        6. IDTCWT reconstruct → pred_img for DAN/LPIPS
         """
         # 1. DTCWT decompose target
-        ll_full, mag, phase = self.dtcwt(x)  # ll_full:(B,3,H,W) YCbCr
+        ll_full, mag, phase = self.dtcwt(x)
         
-        # Also decompose source for APT (if src_image provided, else self-supervised)
+        # Also decompose source for APT
         src_for_apt = src_image if src_image is not None else x
         src_ll_full, src_mag, src_phase = self.dtcwt(src_for_apt)
         
-        # 2. Downsample LL for UNet processing
-        ll, ll_hf_skip = self.ll_downsample(ll_full)
-        src_ll, src_ll_hf_skip = self.ll_downsample(src_ll_full)
+        # 2. Haar DWT → 12ch at 56x56
+        wavelet_12ch = self.ll_dwt(ll_full)      # (B, 12, 56, 56)
+        src_wavelet_12ch = self.ll_dwt(src_ll_full)
         
-        # 3. Add noise to downsampled LL
+        # 3. Per-channel normalize
+        wavelet_norm = self.normalize_wavelet(wavelet_12ch)
+        
+        # 4. Rectified Flow: sample t, interpolate, get velocity target
         B = x.shape[0]
-        t = torch.randint(0, self.num_timesteps, (B,), device=x.device)
-        noisy_ll, noise = self.forward_process(ll, t)
+        t = torch.rand(B, device=x.device)
+        x_t, velocity = self.rf_forward(wavelet_norm, t)
         
-        # 4. Prepare HF conditioning (from source)
+        # 5. Prepare HF conditioning (from source DTCWT)
         hf_condition = torch.cat([src_mag, src_phase], dim=1)
-        ll_size = (ll.shape[2], ll.shape[3])
+        ll_size = (wavelet_12ch.shape[2], wavelet_12ch.shape[3])
         hf_features = self.unet.hf_encoder(hf_condition, ll_size)
         
-        # 5. StarGAN emotion injection on LL
-        unet_input = self._inject_emotion(noisy_ll, emotion_id)
+        # 6. Emotion injection on noisy 12ch
+        unet_input = self._inject_emotion(x_t, emotion_id)
         
-        # 6. UNet forward → noise_pred + Δmag (no Δphase)
-        noise_pred, delta_mag = self.unet(
+        # 7. UNet forward → velocity_pred (12ch) + Δmag (18ch)
+        v_pred, delta_mag = self.unet(
             unet_input, t, emotion_id, hf_features, src_for_apt
         )
         
-        # 7. MagnitudeModulator bias
+        # 8. MagnitudeModulator bias
         emotion_emb = self.unet.emotion_embedding(emotion_id)
         mod_dmag = self.mag_mod(emotion_emb)
         delta_mag = delta_mag + mod_dmag
-        
-        # Clamp Δmag — allow full tanh range ±1.0 (was 0.1×tanh = ±0.1)
         delta_mag = torch.tanh(delta_mag)
         
-        # Chrominance damping on Δmag (out-of-place to avoid breaking autograd)
+        # Chrominance damping
         delta_mag = torch.cat([
             delta_mag[:, :6, :, :],           # Y orientations: full range
             delta_mag[:, 6:, :, :] * 0.3      # Cb/Cr: damped
         ], dim=1)
         
-        # 8. Predict clean LL
-        pred_ll_half = self._predict_x0(noisy_ll, noise_pred, t)
+        # 9. Predict clean x0 from RF: x0 = x_t - t * v_pred
+        t_expand = t.view(-1, 1, 1, 1)
+        pred_wavelet_norm = x_t - t_expand * v_pred
+        pred_wavelet_norm = torch.clamp(pred_wavelet_norm, -5, 5)
         
-        # 9. APT: estimate displacement from Y channel phase difference
-        #    src LL Y at full res, pred LL Y upsampled to full res
+        # 10. Un-normalize → Haar IWT → LL' (112x112)
+        pred_wavelet = self.unnormalize_wavelet(pred_wavelet_norm)
+        pred_ll_full = self.ll_iwt(pred_wavelet)  # (B, 3, 112, 112)
+        
+        # 11. APT: estimate displacement from Y channel
         with torch.amp.autocast('cuda', enabled=False):
-            src_ll_Y = src_ll_full[:, 0:1].float()  # Y channel at H×W
-            pred_ll_up = self.ll_upsample(pred_ll_half, src_ll_hf_skip)
-            pred_ll_Y = pred_ll_up[:, 0:1].float()
+            src_ll_Y = src_ll_full[:, 0:1].float()
+            pred_ll_Y = pred_ll_full[:, 0:1].float()
             displacement = self.apt.solve_displacement(src_ll_Y, pred_ll_Y)
         
-        # 10. Warp source HF coefficients by displacement
+        # 12. Warp DTCWT coefficients by displacement
         warped_mag, warped_phase = self.apt.warp_coefficients(
             src_mag, src_phase, displacement
         )
         
-        # 11. Warp Haar detail bands by displacement
-        warped_hf_skip = self.apt.warp_haar_detail(src_ll_hf_skip, displacement)
-        
-        # 12. Apply Δmag to warped magnitude
+        # 13. Apply Δmag
         pred_mag = warped_mag * (1 + delta_mag)
-        pred_phase = warped_phase  # phase fully determined by APT geometry
+        pred_phase = warped_phase
         
-        # 13. Compute losses
-        ddpm_loss = F.l1_loss(noise_pred, noise)
-        # mag_loss: match predicted magnitude to TARGET magnitude (not zero!)
-        # This allows the model to learn meaningful HF changes
+        # 14. Compute losses
+        # RF velocity loss (weighted: HF channels matter more)
+        v_pred_ll = v_pred[:, :3]
+        v_pred_hf = v_pred[:, 3:]
+        vel_ll = velocity[:, :3]
+        vel_hf = velocity[:, 3:]
+        rf_loss_ll = F.l1_loss(v_pred_ll, vel_ll)
+        rf_loss_hf = F.l1_loss(v_pred_hf, vel_hf)
+        rf_loss = rf_loss_ll + 2.0 * rf_loss_hf
+        
+        # Magnitude loss
         mag_loss = F.l1_loss(pred_mag, mag)
-        chroma_loss = F.l1_loss(pred_ll_half[:, 1:3], ll[:, 1:3])
         
-        # Displacement smoothness loss (TV regularization)
+        # Chroma loss on predicted LL (Cb/Cr channels)
+        pred_ll_3ch = pred_wavelet[:, :3]  # LL subband of 12ch
+        target_ll_3ch = wavelet_12ch[:, :3]
+        chroma_loss = F.l1_loss(pred_ll_3ch[:, 1:3], target_ll_3ch[:, 1:3])
+        
+        # Displacement smoothness
         u_smooth_loss = (torch.mean(torch.abs(displacement[:,:,:,1:] - displacement[:,:,:,:-1])) +
                          torch.mean(torch.abs(displacement[:,:,1:,:] - displacement[:,:,:-1,:])))
         
-        # 14. Reconstruct image for DAN loss
-        pred_ll_full = self.ll_upsample(pred_ll_half, warped_hf_skip)
+        # 15. Reconstruct image for DAN/LPIPS loss
         pred_real = pred_mag * torch.cos(pred_phase)
         pred_imag = pred_mag * torch.sin(pred_phase)
         pred_img = self.idtcwt(pred_ll_full, pred_real, pred_imag)
-        
-        # Safety: replace any NaN/Inf from reconstruction (prevents poisoning DAN/LPIPS)
         pred_img = torch.nan_to_num(pred_img, nan=0.0, posinf=1.0, neginf=-1.0)
         
         return {
-            'ddpm_loss': ddpm_loss,
+            'ddpm_loss': rf_loss,        # key kept as 'ddpm_loss' for training script compat
+            'rf_loss_ll': rf_loss_ll,
+            'rf_loss_hf': rf_loss_hf,
             'mag_loss': mag_loss,
             'chroma_loss': chroma_loss,
             'u_smooth_loss': u_smooth_loss,
@@ -1212,16 +1211,17 @@ class DirectionalWaveDiffusionModel(nn.Module):
         }
     
     @torch.no_grad()
-    def sample(self, src_image, target_emotion_id, num_steps=50, denoising_strength=0.3):
+    def sample(self, src_image, target_emotion_id, num_steps=20, denoising_strength=0.7):
         """
-        Inference: DDIM sampling + APT phase transport.
+        V3 Inference: Euler ODE sampling with Rectified Flow on 12ch wavelet.
         
         Pipeline:
-        1. DTCWT decompose source
-        2. DDIM denoise LL → denoised LL'
-        3. APT: phase diff(src_LL_Y, LL'_Y) → displacement u
-        4. Warp source HF + Haar detail by u, apply Δmag
-        5. IDTCWT reconstruct
+        1. DTCWT decompose source → LL, mag, phase
+        2. Haar DWT → 12ch → normalize
+        3. Mix with noise: x_start = (1-s)*x0_norm + s*noise
+        4. Euler ODE: step from t=s to t=0
+        5. Un-normalize → Haar IWT → LL' (112x112)
+        6. APT warp + delta_mag → IDTCWT reconstruct
         """
         device = src_image.device
         B = src_image.shape[0]
@@ -1229,83 +1229,70 @@ class DirectionalWaveDiffusionModel(nn.Module):
         # 1. DTCWT decompose source
         src_ll_full, src_mag, src_phase = self.dtcwt(src_image)
         
-        # 2. Downsample LL
-        src_ll, ll_hf_skip = self.ll_downsample(src_ll_full)
+        # 2. Haar DWT → 12ch → normalize
+        src_wavelet = self.ll_dwt(src_ll_full)  # (B, 12, 56, 56)
+        src_norm = self.normalize_wavelet(src_wavelet)
         
         # 3. Prepare HF conditioning
         hf_condition = torch.cat([src_mag, src_phase], dim=1)
-        ll_size = (src_ll.shape[2], src_ll.shape[3])
+        ll_size = (src_wavelet.shape[2], src_wavelet.shape[3])
         hf_features = self.unet.hf_encoder(hf_condition, ll_size)
-        
-        # 4. Add noise to source LL
-        start_timestep = max(1, int(denoising_strength * self.num_timesteps))
-        timesteps = torch.linspace(start_timestep - 1, 0,
-                                   min(num_steps, start_timestep),
-                                   dtype=torch.long, device=device)
-        
-        noise = torch.randn_like(src_ll)
-        alpha_start = self.sqrt_alphas_cumprod[start_timestep]
-        sigma_start = self.sqrt_one_minus_alphas_cumprod[start_timestep]
-        x = alpha_start * src_ll + sigma_start * noise
-        
-        # 5. DDIM denoising loop
-        final_dmag = None
         emotion_emb = self.unet.emotion_embedding(target_emotion_id)
         
-        for i, t in enumerate(timesteps):
-            t_tensor = torch.full((B,), t.item(), device=device, dtype=torch.long)
+        # 4. Start from noisy version of source
+        noise = torch.randn_like(src_norm)
+        start_t = denoising_strength  # how much noise to add (0=no change, 1=pure noise)
+        x = (1 - start_t) * src_norm + start_t * noise
+        
+        # 5. Euler ODE: step from t=start_t to t=0
+        timesteps = torch.linspace(start_t, 0, num_steps + 1, device=device)
+        final_dmag = None
+        
+        for i in range(num_steps):
+            t_now = timesteps[i]
+            t_next = timesteps[i + 1]
+            t_tensor = torch.full((B,), t_now.item(), device=device)
             
             unet_input = self._inject_emotion(x, target_emotion_id)
-            noise_pred, delta_mag = self.unet(
+            v_pred, delta_mag = self.unet(
                 unet_input, t_tensor, target_emotion_id, hf_features, src_image
             )
             
             # MagnitudeModulator bias
             mod_dm = self.mag_mod(emotion_emb)
             delta_mag = delta_mag + mod_dm
-            delta_mag = torch.tanh(delta_mag)  # full range ±1.0 (was 0.1×tanh)
+            delta_mag = torch.tanh(delta_mag)
             delta_mag = torch.cat([
                 delta_mag[:, :6, :, :],
                 delta_mag[:, 6:, :, :] * 0.3
-            ], dim=1)  # chroma damping (out-of-place)
-            
+            ], dim=1)
             final_dmag = delta_mag
             
-            # DDIM step
-            alpha_t = self.alphas_cumprod[t.item()]
-            alpha_prev = self.alphas_cumprod[timesteps[i+1].item()] if i < len(timesteps) - 1 else torch.tensor(1.0, device=device)
-            alpha_t = alpha_t.to(device)
-            alpha_prev = alpha_prev.to(device)
-            
-            pred_x0 = (x - torch.sqrt(1 - alpha_t) * noise_pred) / torch.sqrt(alpha_t)
-            pred_x0 = torch.clamp(pred_x0, -3, 3)
-            
-            if i < len(timesteps) - 1:
-                x = torch.sqrt(alpha_prev) * pred_x0 + torch.sqrt(1 - alpha_prev) * noise_pred
-            else:
-                x = pred_x0
+            # Euler step: x_{t-dt} = x_t + (t_next - t_now) * v_pred
+            dt = t_next - t_now  # negative (going from t→0)
+            x = x + dt * v_pred
         
-        # 6. APT: estimate displacement from denoised LL vs source LL
-        denoised_ll_full = self.ll_upsample(x, ll_hf_skip)
+        # 6. Clamp and un-normalize
+        x = torch.clamp(x, -5, 5)
+        pred_wavelet = self.unnormalize_wavelet(x)
+        pred_ll_full = self.ll_iwt(pred_wavelet)  # (B, 3, 112, 112)
+        
+        # 7. APT: estimate displacement
         src_ll_Y = src_ll_full[:, 0:1].float()
-        pred_ll_Y = denoised_ll_full[:, 0:1].float()
+        pred_ll_Y = pred_ll_full[:, 0:1].float()
         displacement = self.apt.solve_displacement(src_ll_Y, pred_ll_Y)
         
-        # 7. Warp source HF by displacement
+        # 8. Warp DTCWT coefficients
         warped_mag, warped_phase = self.apt.warp_coefficients(
             src_mag, src_phase, displacement
         )
-        
-        # 8. Warp Haar detail bands
-        warped_hf_skip = self.apt.warp_haar_detail(ll_hf_skip, displacement)
         
         # 9. Apply Δmag + reconstruct
         new_mag = warped_mag * (1 + final_dmag)
         new_real = new_mag * torch.cos(warped_phase)
         new_imag = new_mag * torch.sin(warped_phase)
         
-        x_full = self.ll_upsample(x, warped_hf_skip)
-        output = self.idtcwt(x_full, new_real, new_imag)
+        output = self.idtcwt(pred_ll_full, new_real, new_imag)
         return output
 
 

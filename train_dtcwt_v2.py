@@ -46,9 +46,9 @@ class TrainingWrapper(nn.Module):
         self.register_buffer('dan_mean', torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
         self.register_buffer('dan_std', torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
 
-    def forward(self, img_real, expr_org):
+    def forward(self, img_real, expr_org, drop_prob=0.0):
         # Main model forward
-        outputs = self.model(img_real, expr_org, src_image=img_real)
+        outputs = self.model(img_real, expr_org, src_image=img_real, drop_prob=drop_prob)
 
         ddpm_loss = outputs['ddpm_loss']
         mag_loss = outputs['mag_loss']
@@ -94,6 +94,8 @@ class TrainingWrapper(nn.Module):
             'dmag_max': dmag_max,
             'disp_mean': disp_mean,
             'disp_max': disp_max,
+            'rf_loss_ll': outputs['rf_loss_ll'].mean() if 'rf_loss_ll' in outputs else ddpm_loss,
+            'rf_loss_hf': outputs['rf_loss_hf'].mean() if 'rf_loss_hf' in outputs else ddpm_loss,
         }
 
 
@@ -200,7 +202,7 @@ def train():
     # ============================
     # Directories
     # ============================
-    exp_name = "DTCWT_apt"
+    exp_name = "DTCWT_V3_RF"
     log_dir = f"{exp_name}/runs/exp"
     model_path = f"{exp_name}/model"
     out_path = f"{exp_name}/out"
@@ -332,20 +334,7 @@ def train():
     print("Loading checkpoint...")
     start_epoch, best_loss, step = load_checkpoint(model_path, base_model, optimizer, device)
 
-    # Fix C: Reset collapsed mag_scale (0.0018 → 0.1)
-    # The old mag_loss=L1(dmag,0) caused this to collapse; with the new
-    # mag_loss=L1(pred_mag, target_mag) the modulator needs to be alive
-    with torch.no_grad():
-        old_val = base_model.mag_mod.mag_scale.item()
-        if old_val < 0.05:
-            base_model.mag_mod.mag_scale = torch.nn.Parameter(
-                torch.tensor(0.1, device=device)
-            )
-            # Re-register with optimizer (old reference is stale)
-            optimizer.param_groups[0]['params'].append(base_model.mag_mod.mag_scale)
-            print(f"  Reset mag_scale: {old_val:.6f} -> 0.1 (was collapsed)")
-        else:
-            print(f"  mag_scale OK: {old_val:.4f}")
+    # (Fresh RF training — no mag_scale reset needed)
 
     # Fixed validation samples
     x_fixed, expr_fixed, _, _ = next(iter(val_dataloader))
@@ -382,7 +371,7 @@ def train():
 
                 # ===== FORWARD PASS (AMP + DataParallel) =====
                 with torch.amp.autocast('cuda'):
-                    outputs = model(img_real, expr_org)
+                    outputs = model(img_real, expr_org, drop_prob=0.1)
 
                     # DataParallel gathers scalars as (num_gpus,) tensors → mean them
                     ddpm_loss = outputs['ddpm_loss'].mean()
@@ -436,19 +425,19 @@ def train():
 
                 # ===== LOGGING =====
                 epoch_bar.set_postfix({
-                    "Tot": f"{total_loss.item():.4f}",
-                    "DDPM": f"{ddpm_loss.item():.4f}",
-                    "DAN": f"{dan_expr_loss.item():.4f}",
-                    "LPIPS": f"{lpips_loss.item():.4f}",
-                    "PSNR": f"{psnr.item():.2f}",
-                    "Coarse": f"{coarse_loss.item():.4f}"
+                    "T": f"{total_loss.item():.3f}",
+                    "RF": f"{ddpm_loss.item():.3f}",
+                    "HF": f"{outputs['rf_loss_hf'].mean().item():.3f}",
+                    "D": f"{dan_expr_loss.item():.3f}",
+                    "LP": f"{lpips_loss.item():.3f}",
+                    "P": f"{psnr.item():.1f}",
                 })
 
                 step += 1
 
                 if i % log_every == 0:
                     writer.add_scalar("Loss/Total", total_loss.item(), step)
-                    writer.add_scalar("Loss/DDPM", ddpm_loss.item(), step)
+                    writer.add_scalar("Loss/Flow", ddpm_loss.item(), step)
                     writer.add_scalar("Loss/DAN", dan_expr_loss.item(), step)
                     writer.add_scalar("Loss/Mag_Preservation", mag_loss.item(), step)
                     writer.add_scalar("Loss/Chroma_Preservation", chroma_loss.item(), step)
@@ -464,6 +453,8 @@ def train():
                     writer.add_scalar("APT/Displacement_mean", outputs['disp_mean'].mean().item(), step)
                     writer.add_scalar("APT/Displacement_max", outputs['disp_max'].max().item(), step)
                     writer.add_scalar("APT/U_smooth_loss", u_smooth_loss.item(), step)
+                    writer.add_scalar("Loss/RF_LL", outputs['rf_loss_ll'].mean().item(), step)
+                    writer.add_scalar("Loss/RF_HF", outputs['rf_loss_hf'].mean().item(), step)
 
                     # Log MagnitudeModulator direction attention
                     with torch.no_grad():
@@ -489,7 +480,10 @@ def train():
                             tensor_images.append(orig_tensor)
                             for emotion_id in range(num_emotions):
                                 emotion_tensor = torch.full((1,), emotion_id, device=device)
-                                generated = base_model.sample(sample, emotion_tensor, num_steps=50, denoising_strength=0.3)
+                                generated = base_model.sample(
+                                    sample, emotion_tensor, 
+                                    num_steps=20, denoising_strength=0.7
+                                )
                                 gen_tensor = (generated[0].clamp(-1, 1) + 1) / 2
                                 tensor_images.append(gen_tensor)
                         if tensor_images:
@@ -521,8 +515,8 @@ def train():
                         generated = base_model.sample(
                             sample,
                             emotion_tensor,
-                            num_steps=50,
-                            denoising_strength=0.3
+                            num_steps=20,
+                            denoising_strength=0.7
                         )
                         gen_tensor = (generated[0].clamp(-1, 1) + 1) / 2
                         tensor_images.append(gen_tensor)
