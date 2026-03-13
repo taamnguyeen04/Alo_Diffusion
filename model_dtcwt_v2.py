@@ -347,8 +347,65 @@ class FreqAwareDownsample(nn.Module):
         return F.silu(out), hi_freq
 
 
+class GuidedWaveletModulation(nn.Module):
+    """Deep Guided Wavelet Modulation (DGWM).
+    
+    Uses the decoder's LL band as a 'guidance image' to predict spatially-
+    varying affine parameters (A, B) that modulate the encoder's HF skip
+    connection before IWT reconstruction.
+    
+    This ensures coherence between the new semantic LL and the old structural
+    HF, eliminating checkerboard artifacts caused by the naive concatenation
+    approach.
+    
+    Mathematical formulation (inspired by Guided Image Filtering):
+        A, B = KernelPredictor(LL_decoder)
+        HF_final = HF_skip + (tanh(A) * HF_skip + tanh(B))
+    
+    The residual connection + tanh bounding ensures:
+        - At initialization (A=0, B=0): HF_final = HF_skip (identity)
+        - During training: gradual, stable modulation
+        - No gradient explosion from unbounded affine transforms
+    """
+    def __init__(self, ll_channels, hf_channels):
+        super().__init__()
+        # Lightweight kernel predictor: LL_decoder → (A, B)
+        # Uses two 3×3 convs with GroupNorm for spatial awareness
+        self.kernel_predictor = nn.Sequential(
+            nn.Conv2d(ll_channels, ll_channels, 3, padding=1),
+            nn.GroupNorm(min(8, ll_channels), ll_channels),
+            nn.SiLU(),
+            nn.Conv2d(ll_channels, hf_channels * 2, 1),  # predict A and B
+        )
+        # Initialize last conv to zero → identity at start
+        nn.init.zeros_(self.kernel_predictor[-1].weight)
+        nn.init.zeros_(self.kernel_predictor[-1].bias)
+    
+    def forward(self, ll_decoder, hf_skip):
+        """Modulate HF skip connection guided by LL decoder features.
+        
+        Args:
+            ll_decoder: (B, ll_channels, H, W) - decoded LL with new semantics
+            hf_skip:    (B, hf_channels, H, W) - encoder HF with old edges
+        Returns:
+            hf_modulated: (B, hf_channels, H, W) - coherent HF for IWT
+        """
+        hf_ch = hf_skip.shape[1]
+        ab = self.kernel_predictor(ll_decoder)  # (B, 2*hf_ch, H, W)
+        A = ab[:, :hf_ch]    # scale
+        B = ab[:, hf_ch:]    # shift
+        # Residual + tanh bounding for stability
+        hf_modulated = hf_skip + (torch.tanh(A) * hf_skip + torch.tanh(B))
+        return hf_modulated
+
+
 class FreqAwareUpsample(nn.Module):
-    """IWT-based upsampling on feature maps. Merges with HF skip."""
+    """IWT-based upsampling with Deep Guided Wavelet Modulation (DGWM).
+    
+    Instead of naively concatenating the decoder's LL with the encoder's HF
+    (which causes checkerboard artifacts due to phase mismatch), DGWM uses
+    the LL band to guide the modulation of the HF band before IWT.
+    """
     def __init__(self, in_channels, out_channels, time_dim, emotion_dim):
         super().__init__()
         self.iwt = IWT()
@@ -356,12 +413,17 @@ class FreqAwareUpsample(nn.Module):
         self.norm = nn.GroupNorm(8, out_channels)
         self.time_mlp = nn.Linear(time_dim, out_channels)
         self.emotion_mlp = nn.Linear(emotion_dim, out_channels)
+        # DGWM: LL (out_channels) guides HF (3*out_channels)
+        self.dgwm = GuidedWaveletModulation(out_channels, 3 * out_channels)
 
     def forward(self, x, hi_freq_skip, time_emb, emotion_emb):
+        # Process LL through conv + time/emotion conditioning
         x_low = F.silu(self.norm(self.conv(x)))
         x_low = x_low + self.time_mlp(F.silu(time_emb))[:, :, None, None]
         x_low = x_low + self.emotion_mlp(F.silu(emotion_emb))[:, :, None, None]
-        x_freq = torch.cat([x_low, hi_freq_skip], dim=1)
+        # DGWM: modulate HF skip using LL guidance (instead of naive cat)
+        hi_freq_modulated = self.dgwm(x_low, hi_freq_skip)
+        x_freq = torch.cat([x_low, hi_freq_modulated], dim=1)
         return self.iwt(x_freq)
 
 
@@ -1017,6 +1079,12 @@ class DirectionalWaveDiffusionModel(nn.Module):
         emotion_dim = 64
         self.mag_mod = MagnitudeModulator(emotion_dim)
         
+        # Change-mask gating: suppress old HF in regions where LL changed
+        # mask_temperature: higher = sharper binary mask (init=5.0 for moderate sharpness)
+        # mask_threshold: change level at which suppression kicks in (init=0.3)
+        self.mask_temperature = nn.Parameter(torch.tensor(5.0))
+        self.mask_threshold = nn.Parameter(torch.tensor(0.3))
+        
         # UNet: input = 12 wavelet channels + num_emotions one-hot
         self.unet = DirectionalWaveDiffusionUNet(
             in_channels=12 + num_emotions,
@@ -1053,7 +1121,40 @@ class DirectionalWaveDiffusionModel(nn.Module):
     
     def unnormalize_wavelet(self, x):
         """Undo per-channel normalization."""
+
         return x * (self.ch_std + 1e-6) + self.ch_mean
+    
+    def _compute_change_mask(self, src_ll, pred_ll, hf_size):
+        """
+        Compute retain mask from LL difference: regions that changed → suppress old HF.
+        
+        Args:
+            src_ll:  (B, 3, H, W) — source LL (YCbCr)
+            pred_ll: (B, 3, H, W) — predicted/denoised LL (YCbCr)
+            hf_size: (Hh, Wh) — spatial size of HF coefficients
+        Returns:
+            retain_mask: (B, 1, Hh, Wh) — 1=keep old HF, 0=suppress old HF
+        """
+        # Change magnitude across all YCbCr channels
+        ll_diff = (pred_ll - src_ll).abs().mean(dim=1, keepdim=True)  # (B, 1, H, W)
+        
+        # Per-image normalization to [0, 1]
+        diff_max = ll_diff.amax(dim=[2, 3], keepdim=True) + 1e-6
+        change_norm = ll_diff / diff_max  # (B, 1, H, W), 0=no change, 1=max change
+        
+        # Smooth sigmoid thresholding: regions above threshold → suppress
+        # retain = sigmoid(temperature * (threshold - change))
+        # When change > threshold: retain → 0 (suppress old HF)
+        # When change < threshold: retain → 1 (keep old HF)
+        temperature = self.mask_temperature.abs() + 1.0  # ensure positive, min=1
+        threshold = torch.sigmoid(self.mask_threshold)     # keep in (0, 1)
+        retain_mask = torch.sigmoid(temperature * (threshold - change_norm))
+        
+        # Resize to HF resolution
+        retain_mask = F.interpolate(retain_mask, size=hf_size, mode='bilinear',
+                                    align_corners=False)
+        
+        return retain_mask
     
     def _inject_emotion(self, x_wavelet, emotion_id):
         """
@@ -1133,6 +1234,14 @@ class DirectionalWaveDiffusionModel(nn.Module):
             unet_input, t, emotion_id, hf_features, src_for_apt
         )
         
+        # Chroma Dampening: UNet over-predicts Cr/Cb velocity (std gap up to 500x)
+        # Dampen chroma v_pred to prevent extreme values in Cr channels
+        # Channel layout: [Y_LL, Cb_LL, Cr_LL, Y_LH, Cb_LH, Cr_LH, Y_HL, Cb_HL, Cr_HL, Y_HH, Cb_HH, Cr_HH]
+        chroma_mask = torch.ones(1, 12, 1, 1, device=v_pred.device)
+        chroma_idx = [1, 2, 4, 5, 7, 8, 10, 11]  # All Cb/Cr channels
+        chroma_mask[:, chroma_idx] = 0.1
+        v_pred = v_pred * chroma_mask
+        
         # 8. MagnitudeModulator bias
         emotion_emb = self.unet.emotion_embedding(emotion_id)
         mod_dmag = self.mag_mod(emotion_emb)
@@ -1165,33 +1274,51 @@ class DirectionalWaveDiffusionModel(nn.Module):
             src_mag, src_phase, displacement
         )
         
-        # 13. Apply Δmag
-        pred_mag = warped_mag * (1 + delta_mag)
+        # 13. Compute change mask from LL difference
+        retain_mask = self._compute_change_mask(
+            src_ll_full, pred_ll_full, warped_mag.shape[2:]
+        )
+        
+        # 14. Apply Δmag with change-gated suppression
+        # retain_mask ≈ 1: keep old HF (identity regions)
+        # retain_mask ≈ 0: suppress old HF (expression-change regions)
+        pred_mag = retain_mask * warped_mag * (1 + delta_mag)
         pred_phase = warped_phase
         
-        # 14. Compute losses
-        # RF velocity loss (weighted: HF channels matter more)
-        v_pred_ll = v_pred[:, :3]
-        v_pred_hf = v_pred[:, 3:]
-        vel_ll = velocity[:, :3]
-        vel_hf = velocity[:, 3:]
-        rf_loss_ll = F.l1_loss(v_pred_ll, vel_ll)
-        rf_loss_hf = F.l1_loss(v_pred_hf, vel_hf)
-        rf_loss = rf_loss_ll + 2.0 * rf_loss_hf
+        # 15. Compute losses
+        # Channel-Grouped RF Loss: separate Y/Cb/Cr to balance gradient pressure
+        # Y channels: [0, 3, 6, 9], Cb channels: [1, 4, 7, 10], Cr channels: [2, 5, 8, 11]
+        y_idx = [0, 3, 6, 9]
+        cb_idx = [1, 4, 7, 10]
+        cr_idx = [2, 5, 8, 11]
+        
+        # Note: velocity is the TARGET (noise - x0), v_pred already has chroma dampening
+        # Apply same dampening to target velocity for consistent loss computation
+        velocity_damped = velocity.clone()
+        velocity_damped[:, chroma_idx] = velocity_damped[:, chroma_idx] * 0.1
+        
+        rf_loss_Y  = F.l1_loss(v_pred[:, y_idx],  velocity_damped[:, y_idx])
+        rf_loss_Cb = F.l1_loss(v_pred[:, cb_idx], velocity_damped[:, cb_idx])
+        rf_loss_Cr = F.l1_loss(v_pred[:, cr_idx], velocity_damped[:, cr_idx])
+        rf_loss = rf_loss_Y + 3.0 * rf_loss_Cb + 3.0 * rf_loss_Cr
+        
+        # For logging compatibility
+        rf_loss_ll = rf_loss_Y
+        rf_loss_hf = rf_loss_Cb + rf_loss_Cr
         
         # Magnitude loss
         mag_loss = F.l1_loss(pred_mag, mag)
         
-        # Chroma loss on predicted LL (Cb/Cr channels)
-        pred_ll_3ch = pred_wavelet[:, :3]  # LL subband of 12ch
-        target_ll_3ch = wavelet_12ch[:, :3]
-        chroma_loss = F.l1_loss(pred_ll_3ch[:, 1:3], target_ll_3ch[:, 1:3])
+        # Chroma loss on ALL Cb/Cr channels (LL + HF subbands, not just LL)
+        pred_chroma = pred_wavelet_norm[:, chroma_idx]
+        target_chroma = (x_t - t_expand * velocity)[:, chroma_idx]  # target x0 chroma
+        chroma_loss = F.l1_loss(pred_chroma, target_chroma)
         
         # Displacement smoothness
         u_smooth_loss = (torch.mean(torch.abs(displacement[:,:,:,1:] - displacement[:,:,:,:-1])) +
                          torch.mean(torch.abs(displacement[:,:,1:,:] - displacement[:,:,:-1,:])))
         
-        # 15. Reconstruct image for DAN/LPIPS loss
+        # 16. Reconstruct image for DAN/LPIPS loss
         pred_real = pred_mag * torch.cos(pred_phase)
         pred_imag = pred_mag * torch.sin(pred_phase)
         pred_img = self.idtcwt(pred_ll_full, pred_real, pred_imag)
@@ -1208,10 +1335,11 @@ class DirectionalWaveDiffusionModel(nn.Module):
             'pred_ll': pred_ll_full,
             'delta_mag': delta_mag,
             'displacement': displacement,
+            'retain_mask': retain_mask,
         }
     
     @torch.no_grad()
-    def sample(self, src_image, target_emotion_id, num_steps=20, denoising_strength=0.7):
+    def sample(self, src_image, target_emotion_id, num_steps=20, denoising_strength=1.0):
         """
         V3 Inference: Euler ODE sampling with Rectified Flow on 12ch wavelet.
         
@@ -1258,6 +1386,11 @@ class DirectionalWaveDiffusionModel(nn.Module):
                 unet_input, t_tensor, target_emotion_id, hf_features, src_image
             )
             
+            # Chroma Dampening (match forward)
+            chroma_mask = torch.ones(1, 12, 1, 1, device=device)
+            chroma_mask[:, [1, 2, 4, 5, 7, 8, 10, 11]] = 0.1
+            v_pred = v_pred * chroma_mask
+            
             # MagnitudeModulator bias
             mod_dm = self.mag_mod(emotion_emb)
             delta_mag = delta_mag + mod_dm
@@ -1268,9 +1401,21 @@ class DirectionalWaveDiffusionModel(nn.Module):
             ], dim=1)
             final_dmag = delta_mag
             
+            # Predict x0 (clean target) for stability and clamping
+            # x_t = (1-t)*x0 + t*noise  => x0 = (x_t - t*noise)/(1-t) 
+            # In Rectified Flow: v = noise - x0 => x0 = x_t - t*v
+            x0_pred = x - t_now * v_pred
+            x0_pred = torch.clamp(x0_pred, -5.0, 5.0)  # Core stability fix
+            
+            # Re-derive velocity from clamped x0
+            v_actual = (x - x0_pred) / t_now if t_now > 0 else v_pred
+            
             # Euler step: x_{t-dt} = x_t + (t_next - t_now) * v_pred
-            dt = t_next - t_now  # negative (going from t→0)
-            x = x + dt * v_pred
+            dt = t_next - t_now  # negative
+            x = x + dt * v_actual
+            
+            # Final safety clamp
+            x = torch.clamp(x, -5.0, 5.0)
         
         # 6. Clamp and un-normalize
         x = torch.clamp(x, -5, 5)
@@ -1287,8 +1432,11 @@ class DirectionalWaveDiffusionModel(nn.Module):
             src_mag, src_phase, displacement
         )
         
-        # 9. Apply Δmag + reconstruct
-        new_mag = warped_mag * (1 + final_dmag)
+        # 9. Compute change mask and apply gated Δmag + reconstruct
+        retain_mask = self._compute_change_mask(
+            src_ll_full, pred_ll_full, warped_mag.shape[2:]
+        )
+        new_mag = retain_mask * warped_mag * (1 + final_dmag)
         new_real = new_mag * torch.cos(warped_phase)
         new_imag = new_mag * torch.sin(warped_phase)
         

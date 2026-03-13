@@ -80,6 +80,9 @@ class TrainingWrapper(nn.Module):
             dmag_max = dmag.abs().max()
             disp_mean = disp.abs().mean()
             disp_max = disp.abs().max()
+            mask = outputs['retain_mask']
+            mask_mean = mask.mean()
+            mask_min = mask.min()
 
         return {
             'ddpm_loss': ddpm_loss,
@@ -96,6 +99,8 @@ class TrainingWrapper(nn.Module):
             'disp_max': disp_max,
             'rf_loss_ll': outputs['rf_loss_ll'].mean() if 'rf_loss_ll' in outputs else ddpm_loss,
             'rf_loss_hf': outputs['rf_loss_hf'].mean() if 'rf_loss_hf' in outputs else ddpm_loss,
+            'mask_mean': mask_mean,
+            'mask_min': mask_min,
         }
 
 
@@ -139,7 +144,13 @@ def load_checkpoint(filepath, model, optimizer, device):
         if os.path.isfile(path_to_try):
             try:
                 checkpoint = torch.load(path_to_try, map_location=device, weights_only=True)
-                model.load_state_dict(checkpoint['model_state_dict'])
+                # Use strict=False to allow adding new modules like DGWM to existing checkpoints
+                missing, unexpected = model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+                if len(missing) > 0:
+                    print(f"  Missing keys (initialized fresh): {len(missing)}")
+                if len(unexpected) > 0:
+                    print(f"  Unexpected keys (ignored): {len(unexpected)}")
+                
                 optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
                 start_epoch = checkpoint['epoch']
                 step = checkpoint['step']
@@ -312,18 +323,22 @@ def train():
     # ============================
     # Separate learning rate for MagnitudePhaseModulator (learn slower)
     mod_params = []
+    mask_params = []
     other_params = []
     for name, param in diff_model.named_parameters():
         if 'mag_mod' in name:
             mod_params.append(param)
+        elif 'mask_temperature' in name or 'mask_threshold' in name:
+            mask_params.append(param)
         else:
             other_params.append(param)
 
-    print(f"MagModulator params: {len(mod_params)}, Other params: {len(other_params)}")
+    print(f"MagModulator params: {len(mod_params)}, Mask params: {len(mask_params)}, Other params: {len(other_params)}")
 
     optimizer = torch.optim.AdamW([
         {'params': other_params, 'lr': lr, 'weight_decay': 1e-4},
-        {'params': mod_params, 'lr': lr * 0.5, 'weight_decay': 1e-6}  # 2x slower
+        {'params': mod_params, 'lr': lr * 0.5, 'weight_decay': 1e-6},  # 2x slower
+        {'params': mask_params, 'lr': lr * 0.1, 'weight_decay': 0.0}   # 10x slower, no decay
     ], betas=(0.9, 0.999))
 
     # AMP mixed precision for VRAM savings (~50%)
@@ -455,6 +470,8 @@ def train():
                     writer.add_scalar("APT/U_smooth_loss", u_smooth_loss.item(), step)
                     writer.add_scalar("Loss/RF_LL", outputs['rf_loss_ll'].mean().item(), step)
                     writer.add_scalar("Loss/RF_HF", outputs['rf_loss_hf'].mean().item(), step)
+                    writer.add_scalar("Mask/RetainMean", outputs['mask_mean'].mean().item(), step)
+                    writer.add_scalar("Mask/RetainMin", outputs['mask_min'].min().item(), step)
 
                     # Log MagnitudeModulator direction attention
                     with torch.no_grad():
@@ -482,7 +499,7 @@ def train():
                                 emotion_tensor = torch.full((1,), emotion_id, device=device)
                                 generated = base_model.sample(
                                     sample, emotion_tensor, 
-                                    num_steps=20, denoising_strength=0.7
+                                    num_steps=20, denoising_strength=1.0
                                 )
                                 gen_tensor = (generated[0].clamp(-1, 1) + 1) / 2
                                 tensor_images.append(gen_tensor)
