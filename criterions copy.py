@@ -12,7 +12,81 @@ from torchvision import models
 from torchvision.models import resnet50
 from dataset import Affectnet
 from torch.utils.data import Dataset, DataLoader
+from model_dtcwt_v3 import DWT
 from model_dtcwt_v3 import DTCWTWrapper
+
+class PerceptualWaveletLoss(nn.Module):
+    """Perceptual loss for wavelet domain with separate handling of LL and HF bands"""
+    def __init__(self):
+        super().__init__()
+        # Use VGG16 for perceptual loss
+        vgg = models.vgg16(weights=models.VGG16_Weights.IMAGENET1K_V1).features
+        self.vgg_blocks = nn.ModuleList([
+            vgg[:4],   # relu1_2
+            vgg[4:9],  # relu2_2
+            vgg[9:16], # relu3_3
+        ])
+        
+        for param in self.vgg_blocks.parameters():
+            param.requires_grad = False
+        
+        self.eval()
+    
+    def forward(self, generated, target, lambda_ll=0.3, lambda_hi=1.0):
+        """
+        Args:
+            generated: Generated image in [-1, 1]
+            target: Target image in [-1, 1]
+            lambda_ll: Weight for perceptual loss on LL band
+            lambda_hi: Weight for L1 loss on HF bands
+        """
+        
+        dwt = DWT().to(generated.device)
+        
+        # Get wavelet decomposition
+        gen_wavelet = dwt(generated)
+        target_wavelet = dwt(target)
+        
+        # Split into LL and HF bands
+        C = generated.shape[1]
+        gen_ll = gen_wavelet[:, :C, :, :]
+        target_ll = target_wavelet[:, :C, :, :]
+        
+        gen_hi = gen_wavelet[:, C:, :, :]
+        target_hi = target_wavelet[:, C:, :, :]
+        
+        # Normalize LL band to [0, 1] for VGG
+        gen_ll_norm = (gen_ll + 1) / 2
+        target_ll_norm = (target_ll + 1) / 2
+        
+        # Resize LL to 224x224 for VGG
+        gen_ll_resized = F.interpolate(gen_ll_norm, size=(224, 224), mode='bilinear')
+        target_ll_resized = F.interpolate(target_ll_norm, size=(224, 224), mode='bilinear')
+        
+        # Apply ImageNet normalization
+        mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(generated.device)
+        std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(generated.device)
+        gen_ll_norm = (gen_ll_resized - mean) / std
+        target_ll_norm = (target_ll_resized - mean) / std
+        
+        # Compute perceptual loss on LL band
+        perceptual_loss = 0.0
+        gen_feats = gen_ll_norm
+        target_feats = target_ll_norm
+        
+        for block in self.vgg_blocks:
+            gen_feats = block(gen_feats)
+            target_feats = block(target_feats)
+            perceptual_loss += F.l1_loss(gen_feats, target_feats)
+        
+        # L1 loss on HF bands
+        hi_loss = F.l1_loss(gen_hi, target_hi)
+        
+        # Combine losses
+        total_loss = lambda_ll * perceptual_loss + lambda_hi * hi_loss
+        
+        return total_loss
+
 
 class PerceptualWaveletLoss_DTCWT(nn.Module):
     """
